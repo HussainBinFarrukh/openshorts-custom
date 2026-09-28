@@ -49,3 +49,6 @@ skills-lock.json
 
 # Instrucciones locales con datos de infra (repo público)
 CLAUDE.local.md
+
+# Self-host automation pipeline state (SQLite, clips, reactions, renders)
+pipeline_data/

@@ -8,6 +8,7 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      - ./pipeline_data:/app/pipeline_data
     restart: unless-stopped
 
   frontend:
