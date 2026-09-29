@@ -1,13 +1,8 @@
 """Hardening from the 22-sep-2026 audit, pinned at the HTTP surface.
 
-- /api/process refuses a tailnet / private URL before any probe runs, and the
-  quality probe runs only AFTER the metering step (balance, job limit, the
-  hourly probe cap), handing the reservation back when it refuses the job.
-- A metered whole-video URL job carries SOURCE_CAP_MINUTES = the reserved
-  minutes, in the job env and in the resume manifest.
+- /api/process refuses a tailnet / private URL before any probe runs.
 - main.py and the probe get an environment without the server secrets.
-- Thumbnail publish status, thumbnail generation and render status are
-  owner-only in cloud mode.
+- A resumed job keeps whatever safety cap its manifest recorded.
 - The public /video/{id} page escapes everything it interpolates.
 """
 import asyncio
@@ -46,37 +41,17 @@ def dirs(tmp_path, monkeypatch):
     return out_root
 
 
-@pytest.fixture()
-def calls(monkeypatch):
-    """Record the order of the metering step and the quality probe."""
-    order = []
-
-    async def _probe(url):
-        order.append("probe")
-        return order_probe_result[0]
-
-    async def _reserve(request, url, input_path, job_id, max_minutes=None):
-        order.append("reserve")
-        request.state.reserved_minutes = 12
-        return 7, 1, "res-1", "starter", None
-
-    released = []
-
-    class _FakeMetering:
-        @staticmethod
-        async def release_reservation(rid):
-            released.append(rid)
-
-    order_probe_result = [{"max_height": 1080, "duration": 600}]
-    monkeypatch.setattr(app_module, "_probe_youtube_quality", _probe)
-    monkeypatch.setattr(app_module, "reserve_process_minutes", _reserve)
-    monkeypatch.setattr(app_module, "_metering", _FakeMetering)
-    monkeypatch.setattr(app_module, "_validate_source_url", _allow_url)
-    return {"order": order, "released": released, "probe_result": order_probe_result}
-
-
 async def _allow_url(url):
     return None
+
+
+@pytest.fixture()
+def quality_probe_ok(monkeypatch):
+    """Stub the quality probe so /api/process never makes a real network call."""
+    async def _probe(url):
+        return {"max_height": 1080, "duration": 600}
+    monkeypatch.setattr(app_module, "_probe_youtube_quality", _probe)
+    monkeypatch.setattr(app_module, "_validate_source_url", _allow_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,41 +89,6 @@ def test_youtube_search_page_is_refused_before_any_probe(dirs, monkeypatch):
     assert resp.status_code == 400
     assert "search results" in resp.json()["detail"]
     assert probed == []
-
-
-def test_quality_probe_runs_after_metering(dirs, calls):
-    resp = _post_process({"url": "https://www.youtube.com/watch?v=ok", "acknowledged": True})
-    assert resp.status_code == 200, resp.text
-    assert calls["order"] == ["reserve", "probe"]
-    assert calls["released"] == []
-
-
-def test_low_quality_confirmation_releases_the_reservation(dirs, calls):
-    calls["probe_result"][0] = {"max_height": 360, "duration": 600}
-    resp = _post_process({"url": "https://www.youtube.com/watch?v=lowq", "acknowledged": True})
-    assert resp.status_code == 200
-    assert resp.json()["needs_confirmation"] is True
-    assert calls["released"] == ["res-1"]
-    assert os.listdir(dirs) == []          # no orphan job dir
-    assert app_module.jobs == {}
-
-
-def test_short_source_rejection_releases_the_reservation(dirs, calls):
-    calls["probe_result"][0] = {"max_height": 1080, "duration": 20}
-    resp = _post_process({"url": "https://www.youtube.com/watch?v=short", "acknowledged": True})
-    assert resp.status_code == 400
-    assert calls["released"] == ["res-1"]
-    assert os.listdir(dirs) == []
-
-
-def test_metered_url_job_is_capped_at_the_reserved_minutes(dirs, calls):
-    resp = _post_process({"url": "https://www.youtube.com/watch?v=ok", "acknowledged": True})
-    job_id = resp.json()["job_id"]
-    job = app_module.jobs[job_id]
-    assert job["env"]["SOURCE_CAP_MINUTES"] == "12"
-    assert "MAX_SOURCE_MINUTES" not in job["env"]
-    manifest = json.load(open(os.path.join(dirs, job_id, app_module._RESUME_FILE)))
-    assert manifest["source_cap_minutes"] == 12
 
 
 def test_resumed_job_keeps_its_safety_cap(dirs, monkeypatch):
@@ -215,66 +155,13 @@ def test_pipeline_code_reads_none_of_the_dropped_secrets():
                     stack.append(n)
 
 
-def test_job_env_has_no_server_secrets(dirs, calls, monkeypatch):
+def test_job_env_has_no_server_secrets(dirs, quality_probe_ok, monkeypatch):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_x")
     monkeypatch.setenv("JWT_SECRET", "jwt")
     resp = _post_process({"url": "https://www.youtube.com/watch?v=ok", "acknowledged": True})
     env = app_module.jobs[resp.json()["job_id"]]["env"]
     assert "STRIPE_SECRET_KEY" not in env and "JWT_SECRET" not in env
     assert env["GEMINI_API_KEY"] == "test-key"
-
-
-# --------------------------------------------------------------------------- #
-# Owner checks (cloud mode)
-# --------------------------------------------------------------------------- #
-class _User:
-    def __init__(self, uid):
-        self.id = uid
-        self.plan = "starter"
-
-
-@pytest.fixture()
-def cloud_as(monkeypatch):
-    who = {"user": None}
-
-    async def _from_request(request):
-        return who["user"]
-    monkeypatch.setattr(app_module, "BILLING_ENABLED", True)
-    monkeypatch.setattr(app_module, "_user_from_request", _from_request)
-    return who
-
-
-def test_publish_status_is_owner_only(cloud_as, monkeypatch):
-    monkeypatch.setattr(app_module, "publish_jobs", {
-        "p1": {"status": "done", "result": {"ok": 1}, "error": None, "user_id": "owner"}})
-    cloud_as["user"] = _User("stranger")
-    assert _client_call("get", "/api/thumbnail/publish/status/p1").status_code == 404
-    cloud_as["user"] = None
-    assert _client_call("get", "/api/thumbnail/publish/status/p1").status_code == 404
-    cloud_as["user"] = _User("owner")
-    resp = _client_call("get", "/api/thumbnail/publish/status/p1")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "done", "result": {"ok": 1}, "error": None}
-
-
-def test_render_status_is_owner_only(cloud_as, monkeypatch):
-    monkeypatch.setattr(app_module, "_render_owners", {"r-1": "owner"})
-    cloud_as["user"] = _User("stranger")
-    assert _client_call("get", "/api/render/r-1").status_code == 404
-    # An id this instance never issued is not proxied at all.
-    cloud_as["user"] = _User("owner")
-    assert _client_call("get", "/api/render/unknown-id").status_code == 404
-
-
-def test_thumbnail_generate_refuses_someone_elses_session(cloud_as, monkeypatch):
-    async def _gemini(request):
-        return "k"
-    monkeypatch.setattr(app_module, "resolve_gemini", _gemini)
-    monkeypatch.setattr(app_module, "thumbnail_sessions", {"s-1": {"user_id": "owner"}})
-    cloud_as["user"] = _User("stranger")
-    resp = _client_call("post", "/api/thumbnail/generate",
-                        data={"session_id": "s-1", "title": "t"})
-    assert resp.status_code == 404
 
 
 # --------------------------------------------------------------------------- #

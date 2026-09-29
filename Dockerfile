@@ -9,15 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
-# Copy and install Python dependencies
-COPY requirements.txt requirements-billing.txt ./
+COPY requirements.txt ./
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
-# Cloud (paid mode) deps: installed always so one image serves both modes; they
-# are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
-RUN pip install --no-cache-dir -r requirements-billing.txt
 
 # GPU build (--build-arg GPU=1): user-space CUDA libs only — the NVIDIA
 # container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2

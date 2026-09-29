@@ -117,19 +117,10 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:
             pass
 
-# ---- Cloud billing (paid / managed-keys) integration --------------------------
-# All paid-mode code lives in the optional `cloud/` package and is imported ONLY
-# when BILLING_ENABLED is set. With the flag off, the app behaves exactly as the
-# self-hosted BYOK app does today (no extra dependencies required).
-BILLING_ENABLED = os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
-
-# Job/file retention (issue #46). Self-host defaults to 24h: the 1h sweep kept
-# deleting finished projects under users who never touched their env, and the
-# OUTPUT_MAX_GB / UPLOADS_MAX_GB caps below already bound the disk. Cloud keeps
-# the tight default because clips are archived to R2 as soon as a job finishes.
-JOB_RETENTION_SECONDS = int(
-    os.environ.get("JOB_RETENTION_SECONDS", "3600" if BILLING_ENABLED else "86400")
-)
+# Job/file retention (issue #46). The 1h sweep kept deleting finished projects
+# under users who never touched their env, and the OUTPUT_MAX_GB /
+# UPLOADS_MAX_GB caps below already bound the disk, so this defaults to 24h.
+JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "86400"))
 # The retained download of a URL job (--keep-original) is the one artifact that
 # is a full copy of someone else's video rather than something we made, so it
 # can be aged out ahead of the clips it produced. Defaults to the job clock,
@@ -141,43 +132,21 @@ JOB_RETENTION_SECONDS = int(
 SOURCE_RETENTION_SECONDS = int(
     os.environ.get("SOURCE_RETENTION_SECONDS", str(JOB_RETENTION_SECONDS))
 )
-# Force full pipeline logs to the client even under billing (local debugging).
+# Force full pipeline logs to the client (local debugging).
 DEBUG_LOGS = os.environ.get("DEBUG_LOGS", "").lower() in ("1", "true", "yes")
 
-if BILLING_ENABLED:
-    import cloud
-    from cloud import managed_keys, metering as _metering, config as _cloud_config, alerts as _alerts
-    from cloud.auth import get_current_user_optional
-else:
-    cloud = None
-    managed_keys = None
-    _metering = None
-    _cloud_config = None
-    _alerts = None
 
-    async def get_current_user_optional(request: Request):
-        # No-op dependency in self-host mode: every request is anonymous / BYOK.
-        return None
+async def get_current_user_optional(request: Request):
+    # No auth model: every request is anonymous / BYOK.
+    return None
 
 
 async def _user_from_request(request: Request):
-    """Load the authenticated cloud user (or None). Cheap indexed lookup."""
     return await get_current_user_optional(request)
 
 
 async def resolve_gemini(request: Request) -> Optional[str]:
-    """Resolve the Gemini API key for a request.
-
-    Cloud (hosted) is PAID-ONLY: there is no BYOK for the core pipeline, so the
-    ``X-Gemini-Key`` header is ignored — an entitled user (active plan or trial)
-    gets the managed server key, everyone else gets ``None`` (→ 402, start trial).
-    Self-host keeps BYOK: header wins, else the env fallback.
-    """
-    if BILLING_ENABLED:
-        user = await _user_from_request(request)
-        if managed_keys.has_active_entitlement(user):
-            return managed_keys.gemini_key()
-        return None
+    """Resolve the Gemini API key for a request: header wins, else the env fallback."""
     header = request.headers.get("X-Gemini-Key")
     if header:
         return header
@@ -187,17 +156,9 @@ async def resolve_gemini(request: Request) -> Optional[str]:
 async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
     """Resolve the Upload-Post key and the profile to post as.
 
-    Returns ``(api_key, forced_profile_username_or_None)``. Cloud is paid-only:
-    an entitled user gets the managed key + their own forced profile (body key /
-    user_id ignored); a non-entitled user gets ``(None, None)``. Self-host keeps
-    BYOK: header, then body key, then env.
+    Returns ``(api_key, forced_profile_username_or_None)``. BYOK: header, then
+    body key, then env; the profile is always client-supplied (no forced profile).
     """
-    if BILLING_ENABLED:
-        user = await _user_from_request(request)
-        if managed_keys.has_active_entitlement(user):
-            profile = await cloud.social_profiles.ensure_profile(user)
-            return managed_keys.upload_post_key(), profile
-        return None, None
     header = request.headers.get("X-Upload-Post-Key")
     key = header or body_key or os.environ.get("UPLOAD_POST_API_KEY")
     return key, None
@@ -206,22 +167,9 @@ async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
 def resolve_post_profile(forced_profile: Optional[str], client_profile: Optional[str]) -> str:
     """The Upload-Post profile to act as, for posting/scheduling/analytics.
 
-    Fails closed on purpose. Every call site used to read
-    ``forced_profile or client_profile``, which quietly honours whatever
-    profile the *client* asked for if the server ever failed to resolve its
-    own — one refactor of ``resolve_upload_post`` away from letting a cloud
-    user schedule into someone else's connected accounts. In cloud mode the
-    client value is never consulted: either the server knows the caller's
-    profile or the request is refused.
+    No user model: the caller owns the Upload-Post account whose key resolved
+    above, so it picks its own profile.
     """
-    if BILLING_ENABLED:
-        if not forced_profile:
-            raise HTTPException(
-                status_code=503,
-                detail="Could not resolve your social profile. Please try again.")
-        return forced_profile
-    # Self-host: no user model, the caller owns the Upload-Post account whose
-    # key resolved above, so it picks its own profile.
     profile = forced_profile or client_profile
     if not profile:
         raise HTTPException(status_code=400, detail="Missing Upload-Post user profile")
@@ -229,324 +177,34 @@ def resolve_post_profile(forced_profile: Optional[str], client_profile: Optional
 
 
 def gemini_missing_error():
-    """The right 4xx when no Gemini key could be resolved.
-
-    402 for a signed-in-but-not-entitled cloud user (needs a plan); 400 otherwise
-    (BYOK header simply missing).
-    """
-    if BILLING_ENABLED:
-        return HTTPException(status_code=402, detail={
-            "error": "no_plan",
-            "message": "This action needs an active plan. Choose a plan or add your own API key.",
-        })
+    """The right 4xx when no Gemini key could be resolved (BYOK header missing)."""
     return HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
 
-# Probe rate limiter. In-memory, resets on restart by design — the hard monthly
-# quota lives in the metering ledger; this only stops someone hammering the
-# proxy with metadata probes.
-_probe_times: dict = {}  # user_id -> [monotonic timestamps]
-PROBES_PER_HOUR = 15
-
-# Out-of-minutes upsell email: at most one per user per day (a client may
-# retry the same 402 many times).
-_last_quota_email: dict = {}
-_QUOTA_EMAIL_COOLDOWN = 24 * 3600
-
-
-def _maybe_send_quota_email(user):
-    if user is None or user.plan != "free" or not user.email:
-        return
-    now = time.monotonic()
-    last = _last_quota_email.get(str(user.id))
-    if last is not None and now - last < _QUOTA_EMAIL_COOLDOWN:
-        return
-    _last_quota_email[str(user.id)] = now
-    from cloud.emails import send_out_of_minutes_email
-    upgrade_url = f"{_cloud_config.settings.frontend_url}/#/pricing"
-    asyncio.create_task(send_out_of_minutes_email(user.email, upgrade_url, user.id))
-
-
-def _check_probe_rate(user_id):
-    now = time.monotonic()
-    times = _probe_times.setdefault(str(user_id), [])
-    times[:] = [t for t in times if now - t < 3600]
-    if len(times) >= PROBES_PER_HOUR:
-        raise HTTPException(status_code=429,
-                            detail="Too many requests this hour. Please slow down.")
-    times.append(now)
-
-
-def partial_offer(minutes_required: float, minutes_remaining: float) -> int:
-    """Minutes of the source we can offer to clip instead of a 402, or 0.
-
-    The offer is the caller's whole remaining balance, floored to full minutes
-    (the reservation is in whole minutes), and only when it is both worth
-    clipping (``PARTIAL_MIN_MINUTES``) and actually shorter than the source.
-    """
-    from cloud import config as _cfg  # plain constants; importable with billing off
-    offer = int(math.floor(max(0.0, float(minutes_remaining or 0))))
-    if offer < _cfg.PARTIAL_MIN_MINUTES or offer >= minutes_required:
-        return 0
-    return offer
-
-
-def plan_partial_minutes(minutes_required: int, minutes_remaining: float, max_minutes):
-    """How many minutes to reserve for a source of ``minutes_required``.
-
-    Returns ``(reserve, partial)``: ``partial`` is None for a normal whole-video
-    job, or ``{"processed_minutes", "total_minutes"}`` when the caller asked
-    (``max_minutes``) to clip only the first part. The slice is capped by the
-    balance as well as by the request, so a client cannot name a bigger cut
-    than it can pay for; when the slice would be too small the request falls
-    through to the ordinary quota check (and its 402).
-    """
-    if max_minutes is None:
-        return minutes_required, None
-    try:
-        asked = float(max_minutes)
-    except (TypeError, ValueError):
-        return minutes_required, None
-    from cloud import config as _cfg
-    cap = int(math.floor(min(asked, max(0.0, float(minutes_remaining or 0)))))
-    if minutes_required <= cap or cap < _cfg.PARTIAL_MIN_MINUTES:
-        return minutes_required, None
-    return cap, {"processed_minutes": cap, "total_minutes": minutes_required}
-
-
-def free_overflow(plan, minutes_required, minutes_remaining, max_minutes, processed_before):
-    """What a free account gets for a source longer than its balance.
-
-    Returns ``(grant, max_minutes)``:
-
-    * ``grant`` is the whole (floored) balance when this is the account's first
-      video and it fits ``FIRST_VIDEO_MAX_MINUTES``: the video is clipped whole
-      and only the balance is charged, so it lands at zero.
-    * otherwise ``max_minutes`` becomes the balance, so the job clips the first
-      N minutes (``plan_partial_minutes``) instead of answering with the wall.
-
-    Anything else (a paid plan, a source that fits, a client that already named
-    its own cut) passes through untouched.
-    """
-    from cloud import config as _cfg
-    remaining = max(0.0, float(minutes_remaining or 0))
-    if plan != "free" or max_minutes is not None or minutes_required <= remaining:
-        return None, max_minutes
-    if (not processed_before and remaining >= 1
-            and minutes_required <= _cfg.FIRST_VIDEO_MAX_MINUTES):
-        return int(math.floor(remaining)), None
-    return None, remaining
-
-
 async def reserve_process_minutes(request, url, input_path, job_id, max_minutes=None):
-    """Meter a managed /api/process request.
-
-    Returns (user_id, priority, reservation_id, plan, partial).
-
-    ``partial`` is None unless the caller asked (``max_minutes``) to clip only
-    the first part of a source its balance cannot cover whole; then it is the
-    ``plan_partial_minutes`` dict and only that many minutes are reserved.
-
-    BYOK / self-host requests don't consume minutes (priority 2, no reservation).
-    For a managed (entitled, no BYOK header) request this probes the input
-    duration, enforces the per-user concurrent-job limit, and reserves minutes —
-    raising 402 (quota) or 429 (too many jobs) as needed.
-
-    NOTE: in cloud mode ``resolve_gemini`` ignores ``X-Gemini-Key`` (paid-only,
-    no BYOK), so we must NOT skip metering just because that header is present —
-    otherwise a client could send a dummy header and run unlimited managed jobs
-    on the operator's key for free. Only skip metering when billing is off.
-    """
-    if not BILLING_ENABLED:
-        return None, 2, None, None, None
-    user = await _user_from_request(request)
-    if not managed_keys.has_active_entitlement(user):
-        return None, 2, None, None, None  # shouldn't happen (resolve_gemini would have 402'd)
-
-    priority = _cloud_config.PLAN_PRIORITY.get(user.plan, 1)
-
-    # Per-user simultaneous job cap.
-    limit = _cloud_config.PLAN_JOB_LIMIT.get(user.plan, 2)
-    active = sum(1 for j in jobs.values()
-                 if j.get('user_id') == user.id and j.get('status') in ('queued', 'processing'))
-    if active >= limit:
-        raise HTTPException(status_code=429,
-                            detail="You already have the maximum number of jobs running. Please wait.")
-
-    # Out of minutes -> 402 before probing. The probe is a real yt-dlp metadata
-    # fetch through the download proxies, and every job costs at least one
-    # minute, so a user at zero can be turned away without spending bandwidth on
-    # a duration we are about to reject anyway (4 of 12 submissions in the
-    # 21-aug-2026 sample were quota 402s that had already paid for their probe).
-    balance = await _metering.get_balance(user.id)
-    if balance["remaining"] < 1:
-        _maybe_send_quota_email(user)
-        raise HTTPException(status_code=402, detail={
-            "error": "quota_exceeded",
-            "minutes_required": 1,
-            "minutes_remaining": balance["remaining"],
-            "partial_minutes": 0,
-        })
-
-    # Probe rate limit: probing costs a (cheap) proxied metadata call. The
-    # 20-minute monthly quota is the real bound on free usage; there is no daily
-    # job cap.
-    _check_probe_rate(user.id)
-
-    # Probe input duration (blocking → run in a thread). When today's paid
-    # traffic is over budget, the probe (and below, the job itself) runs
-    # without the per-GB proxy: statics or nothing.
-    paid_allowed = True
-    try:
-        from cloud import proxy_ledger as _pl
-        paid_allowed = not await _pl.budget_exceeded()
-    except Exception:
-        pass
-    loop = asyncio.get_event_loop()
-    try:
-        if url:
-            minutes = await loop.run_in_executor(
-                None, functools.partial(_metering.probe_url_minutes, url,
-                                        allow_paid=paid_allowed))
-        else:
-            minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
-    except Exception as e:
-        from yt_clients import NotASingleVideo
-        if isinstance(e, NotASingleVideo):
-            raise HTTPException(status_code=400, detail=(
-                f"{e} Paste the link of one video (youtube.com/watch?v=... "
-                "or youtu.be/...)."))
-        raise HTTPException(status_code=400,
-                            detail="Could not determine the video duration. Try a different source.")
-    finally:
-        # A probe that had to reach the paid proxy leaves an event behind;
-        # record it (DB row + Telegram) whether or not the probe succeeded.
-        try:
-            from cloud import proxy_ledger as _pl
-            await _pl.drain_probe_events()
-        except Exception:
-            pass
-    minutes = max(1, math.ceil(minutes))
-
-    # Free account past its balance: the first video (up to
-    # FIRST_VIDEO_MAX_MINUTES) is clipped whole for the balance; any other is
-    # clipped to the first N minutes. Neither sees the wall.
-    grant = None
-    ip_hash = ""
-    if balance.get("plan") == "free" and minutes > balance["remaining"] and max_minutes is None:
-        processed_before = await _metering.has_processed_before(user.id)
-        if not processed_before:
-            # One whole first video per network (FIRST_VIDEO_IP_WINDOW_DAYS),
-            # so a stack of Google accounts from one IP gets one, not many.
-            ip_hash = _metering.ip_fingerprint(request.client.host if request.client else "")
-            if await _metering.ip_had_first_video(ip_hash):
-                processed_before = True
-        grant, max_minutes = free_overflow("free", minutes, balance["remaining"],
-                                           max_minutes, processed_before)
-
-    # A source longer than the balance can be clipped in part instead of
-    # refused: the wall offers "the first N minutes" (``partial_minutes`` in
-    # the 402 below) and the client resubmits with ``max_minutes``.
-    if grant is not None:
-        reserve, partial = grant, None
-    else:
-        reserve, partial = plan_partial_minutes(minutes, balance["remaining"], max_minutes)
-    try:
-        reservation_id = await _metering.reserve_minutes(user.id, reserve, job_id)
-        # Read by process_endpoint for the download's safety cut
-        # (SOURCE_CAP_MINUTES); kept off the return tuple on purpose. A granted
-        # first video is processed whole, so its cap is the probed length.
-        request.state.reserved_minutes = minutes if grant is not None else reserve
-        request.state.first_video = grant is not None
-        if grant is not None:
-            try:
-                await _metering.record_first_video(ip_hash, job_id)
-            except Exception as e:  # the grant stands; only the IP memory is lost
-                print(f"⚠️  Could not record first-video grant: {e}")
-    except _metering.QuotaExceeded as e:
-        _maybe_send_quota_email(user)
-        raise HTTPException(status_code=402, detail={
-            "error": "quota_exceeded",
-            "minutes_required": e.required,
-            "minutes_remaining": e.remaining,
-            "partial_minutes": partial_offer(e.required, e.remaining),
-        })
-
-    return user.id, priority, reservation_id, user.plan, partial
+    """No metering: self-host requests don't consume minutes (priority 2, no
+    reservation, no plan, no partial-clip offer)."""
+    return None, 2, None, None, None
 
 
 async def reserve_managed_action(request, minutes, job_id, job_type):
-    """Reserve quota for a synchronous managed action (e.g. thumbnail image gen).
-
-    Returns a reservation_id to commit/release around the work, or None for
-    BYOK / self-host. Raises 402 when the user is out of minutes.
-    """
-    if not BILLING_ENABLED:
-        return None
-    if minutes <= 0:
-        # Free action (e.g. burning captions). Skip the ledger entirely rather
-        # than writing a 0-minute row on every call — the endpoint's own
-        # entitlement gate is what bounds it.
-        return None
-    user = await _user_from_request(request)
-    if not managed_keys.has_active_entitlement(user):
-        return None  # BYOK header path (self-host) — not metered
-    try:
-        return await _metering.reserve_minutes(user.id, minutes, job_id, job_type)
-    except _metering.QuotaExceeded as e:
-        _maybe_send_quota_email(user)
-        raise HTTPException(status_code=402, detail={
-            "error": "quota_exceeded",
-            "minutes_required": e.required,
-            "minutes_remaining": e.remaining,
-        })
+    """No metering: self-host actions aren't reserved against a ledger."""
+    return None
 
 
 async def require_managed_entitlement(request):
-    """Gate a managed compute endpoint that doesn't resolve a Gemini key itself.
-
-    Some endpoints (subtitle/hook FFmpeg re-encodes, render proxy, the thumbnail
-    upload that kicks off a YouTube download + Whisper) do expensive server work
-    without ever calling ``resolve_gemini``, so nothing was stopping an anonymous
-    or non-entitled caller from driving unbounded compute in cloud mode. In cloud
-    mode this rejects them with 402; it's a no-op for self-host (BILLING off).
-    """
-    if not BILLING_ENABLED:
-        return None
-    user = await _user_from_request(request)
-    if not managed_keys.has_active_entitlement(user):
-        raise gemini_missing_error()
-    return user
+    """No entitlement gate in self-host: every caller is allowed through."""
+    return None
 
 
 async def _owner_id(request):
-    """The authenticated cloud user's id to stamp on a new job/session, or None
-    for self-host / BYOK / anonymous (BILLING off → nothing to scope)."""
-    if not BILLING_ENABLED:
-        return None
-    user = await _user_from_request(request)
-    return user.id if user else None
+    """No user model: nothing to stamp on a new job/session."""
+    return None
 
 
 async def _assert_job_owner(request, record):
-    """Cloud multi-tenant guard: reject unless the caller owns this in-memory
-    job/session record.
-
-    No-op for self-host (BILLING off) and for records with no owner stamped
-    (BYOK / self-host jobs never set ``user_id``). Returns 404 rather than 403 so
-    a non-owner can't even confirm the id exists. UUID ids already make these
-    stores hard to enumerate; this closes the gap for a shared/leaked id.
-    """
-    if not BILLING_ENABLED:
-        return
-    owner = record.get("user_id") if isinstance(record, dict) else None
-    if owner is None:
-        return
-    user = await _user_from_request(request)
-    # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
-    # the .owner sidecar store its string form — UUID != str is always True.
-    if user is None or str(user.id) != str(owner):
-        raise HTTPException(status_code=404, detail="Not found")
+    """No-op: no user model, so no per-owner job/session guard to enforce."""
+    return
 
 # Application State
 # PriorityQueue holds (priority, seq, job_id). Lower priority dispatches first:
@@ -1238,20 +896,8 @@ def _resume_interrupted_jobs() -> set:
                 keep_reservations.discard(str(reservation_id))  # let the sweep refund it
             continue
 
-        # Rebuild env from scratch — the manifest holds no secrets. Managed
-        # (cloud) jobs get the server key; self-host falls back to its env key.
+        # Rebuild env from scratch — the manifest holds no secrets.
         env = child_env()
-        try:
-            from cloud import proxy_ledger as _pl
-            if BILLING_ENABLED and _pl.budget_exceeded_sync():
-                env.pop("PROXY_URL", None)  # daily paid-proxy budget hit
-        except Exception:
-            pass
-        if BILLING_ENABLED and user_id is not None:
-            try:
-                env["GEMINI_API_KEY"] = managed_keys.gemini_key()
-            except Exception:
-                pass
         if m.get("watermark"):
             env["WATERMARK"] = "1"
         else:
@@ -1574,14 +1220,6 @@ def _job_source_url(job) -> Optional[str]:
 
 async def _track_proxy_usage(job_id):
     job = jobs.get(job_id) or {}
-    # Durable trail + Telegram page whenever the per-GB proxy carried bytes
-    # (cloud mode only: self-host has no DB and pays nobody per GB).
-    if BILLING_ENABLED and job.get('proxy_route'):
-        try:
-            from cloud import proxy_ledger as _pl
-            await _pl.record_download(job_id, job.get('proxy_route'), _job_source_url(job))
-        except Exception as e:
-            print(f"⚠️ proxy ledger failed for {job_id}: {e}")
     nbytes = job.get('proxy_bytes') or 0
     if not nbytes:
         return
@@ -1590,16 +1228,10 @@ async def _track_proxy_usage(job_id):
         _proxy_month.update(month=month, bytes=0, alerted=False)
     _proxy_month["bytes"] += nbytes
     gb = _proxy_month["bytes"] / 1e9
-    if gb >= PROXY_ALERT_GB and not _proxy_month["alerted"] and _alerts:
+    if gb >= PROXY_ALERT_GB and not _proxy_month["alerted"]:
         _proxy_month["alerted"] = True
-        try:
-            await _alerts.send_admin_alert(
-                "Proxy bandwidth threshold",
-                f"Managed downloads have used {gb:.1f} GB of proxy bandwidth in {month} "
-                f"(threshold {PROXY_ALERT_GB} GB). Review free-plan usage.",
-            )
-        except Exception as e:
-            print(f"⚠️ Proxy alert failed: {e}")
+        print(f"⚠️ Proxy bandwidth threshold: {gb:.1f} GB of proxy bandwidth used in "
+              f"{month} (threshold {PROXY_ALERT_GB} GB).")
 
 
 async def run_job_wrapper(job_id):
@@ -1744,55 +1376,22 @@ def _schedule_auto_retry(job_id, job):
 
 
 async def _archive_managed_job(job_id):
-    if not BILLING_ENABLED:
-        return
-    job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed':
-        return
-    clips = (job.get('result') or {}).get('clips') or []
-    if not clips:
-        return
-    try:
-        await cloud.videos.archive_job(job['user_id'], job_id, clips, job['output_dir'])
-    except Exception as e:
-        print(f"⚠️  R2 archive error for {job_id}: {e}")
+    """No-op: no durable user library to archive clips into."""
+    return
 
 
 def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
-    """Fire-and-forget R2 re-archive of an edited clip (managed jobs only).
-
-    Keeps the user's durable library (history/projects) pointing at the current
-    version of each clip without blocking the edit response."""
-    if not BILLING_ENABLED:
-        return
-    user_id = (jobs.get(job_id) or {}).get('user_id')
-    if not user_id:
-        return
-    output_dir = os.path.join(OUTPUT_DIR, job_id)
-
-    async def _run():
-        try:
-            await cloud.videos.archive_clip_edit(user_id, job_id, clip_index, output_dir, filename)
-        except Exception as e:
-            print(f"⚠️  R2 edit archive error for {job_id}: {e}")
-
-    asyncio.create_task(_run())
+    """No-op: no durable user library to re-archive an edited clip into."""
+    return
 
 
 async def _autopilot_job_finished(job_id, job):
-    if not BILLING_ENABLED or not job or not job.get('user_id'):
-        return
-    try:
-        reason = None
-        if job.get('status') != 'completed':
-            reason = _alerts._classify_failure(_job_error_text(job.get('logs', [])))
-        await cloud.autopilot.on_job_finished(job_id, job, reason)
-    except Exception as e:
-        print(f"⚠️  Autopilot completion error for {job_id}: {e}")
+    """No-op: Autopilot is a cloud-only feature."""
+    return
 
 
 async def _pipeline_job_finished(job_id, job):
-    if BILLING_ENABLED or not job:
+    if not job:
         return
     try:
         await _pipeline.on_job_finished(job_id, job)
@@ -1801,65 +1400,13 @@ async def _pipeline_job_finished(job_id, job):
 
 
 async def _notify_clips_ready(job_id):
-    """Email the owner when their clips finish — processing takes minutes, so
-    this lets them close the tab. Once per job (email_sent flag)."""
-    if not BILLING_ENABLED:
-        return
-    job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed' or job.get('email_sent'):
-        return
-    clips = (job.get('result') or {}).get('clips') or []
-    if not clips:
-        return
-    job['email_sent'] = True
-    try:
-        from cloud.database import session as cloud_session
-        from cloud.models import User
-        from cloud.emails import send_clips_ready_email
-        async with cloud_session() as s:
-            user = await s.get(User, job['user_id'])
-        if not user or not user.email:
-            return
-        title = clips[0].get('video_title_for_youtube_short') or clips[0].get('title') or "Your video"
-        # #app opens the app itself. The bare frontend URL showed the marketing
-        # landing to anyone whose browser had not already set the skip flag,
-        # which is the wrong page for someone clicking "View my clips".
-        await send_clips_ready_email(user.email, title, len(clips),
-                                     f"{_cloud_config.settings.frontend_url}/#app")
-    except Exception as e:
-        print(f"⚠️  Clips-ready email error for {job_id}: {e}")
+    """No-op: no email/account model to notify."""
+    return
 
 
 async def _notify_clip_activity(job_id):
-    """Telegram pulse when a PAID user's clips are created. Free-tier activity
-    (including first clips) is deliberately silent: at current signup volume it
-    drowned the ops channel without being actionable.
-    Telegram-only (best effort, no email)."""
-    if not BILLING_ENABLED:
-        return
-    job = jobs.get(job_id) or {}
-    if not job.get('user_id') or job.get('status') != 'completed':
-        return
-    clips = (job.get('result') or {}).get('clips') or []
-    if not clips:
-        return
-    try:
-        from cloud.database import session as cloud_session
-        from cloud.models import User
-        from cloud import metering
-        async with cloud_session() as s:
-            user = await s.get(User, job['user_id'])
-            if not user:
-                return
-            sub = await metering._active_subscription(s, user.id)
-        if sub is None:
-            return
-        title = clips[0].get('video_title_for_youtube_short') or clips[0].get('title') or "video"
-        n = len(clips)
-        await _alerts.send_telegram(
-            f"🎬 Clips created\n{user.email} ({sub.plan}) — “{title}” ({n} clip{'s' if n != 1 else ''})")
-    except Exception as e:
-        print(f"⚠️  Clip-activity notify error for {job_id}: {e}")
+    """No-op: no Telegram ops channel in self-host."""
+    return
 
 
 # Markers that identify a line as an actual error rather than progress noise.
@@ -1902,57 +1449,8 @@ def _job_error_text(logs) -> str:
 
 
 async def _record_job_alert(job_id):
-    if not BILLING_ENABLED:
-        return
-    job = jobs.get(job_id) or {}
-    if not job.get('user_id'):
-        return  # only track managed jobs
-    ok = job.get('status') == 'completed'
-    err = "" if ok else _job_error_text(job.get('logs', []))
-    try:
-        await _alerts.record_job_outcome(ok, err)
-    except Exception as e:
-        print(f"⚠️  Alert recording error for {job_id}: {e}")
-    await _track_job_outcome(job, ok, err)
-
-
-async def _track_job_outcome(job, ok, err):
-    """Report the job to OpenPanel, with the user's job index.
-
-    The index is what makes the retention question answerable: on 26-jul-2026,
-    491 of 564 users who ever processed a video did it exactly once. Counting
-    distinct users at index 1 versus index >= 2 measures whether the clip
-    quality work moved that, which nothing in the stack could do before.
-
-    Client-side analytics cannot cover this: a render finishes minutes later,
-    often after the tab is closed, and ad-blockers eat a share of the rest.
-    """
-    try:
-        from cloud import analytics as _an
-        from sqlalchemy import text as _sa_text
-        from cloud import database as _db
-        user_id = job.get('user_id')
-        job_index = None
-        try:
-            async with _db.session() as s:
-                job_index = (await s.execute(_sa_text(
-                    "select count(*) from usage_ledger "
-                    "where user_id = :uid and job_type = 'process'"),
-                    {"uid": user_id})).scalar()
-        except Exception:
-            pass  # an index we cannot read is not worth failing a job over
-        clips = len(((job.get('result') or {}).get('clips')) or [])
-        _an.track(
-            "ClipsDelivered" if ok else "JobFailed",
-            user_id=user_id,
-            job_index=job_index,
-            clips=clips if ok else None,
-            plan=job.get('user_plan'),
-            source="url" if _job_source_url(job) else "upload",
-            reason=(_alerts._classify_failure(err) if not ok and err else None),
-        )
-    except Exception as e:
-        print(f"⚠️  Analytics error: {e}")
+    """No-op: no ops-alerting/analytics backend in self-host."""
+    return
 
 
 # --- Job completion webhooks --------------------------------------------------
@@ -1984,29 +1482,13 @@ async def _webhook_clip_entries(job_id, job):
             "title": clip.get('title') or clip.get('video_title_for_youtube_short'),
             "video_url": f"{base}{rel}" if rel.startswith("/") and base else rel,
         })
-    if BILLING_ENABLED and job.get('user_id'):
-        try:
-            from sqlalchemy import select as _select
-            from cloud.database import session as cloud_session
-            from cloud.models import UserVideo
-            from cloud import storage as _storage
-            async with cloud_session() as s:
-                vids = list((await s.execute(
-                    _select(UserVideo).where(UserVideo.job_id == job_id)
-                )).scalars())
-            for v in vids:
-                if v.clip_index is not None and v.clip_index < len(entries):
-                    entries[v.clip_index]["download_url"] = _storage.presigned_get(
-                        v.r2_key, expires=24 * 3600)
-        except Exception as e:
-            print(f"⚠️ Webhook R2 links failed for {job_id}: {e}")
     return entries
 
 
 async def _deliver_webhook(url, body: bytes, secret):
-    headers = {"Content-Type": "application/json", "User-Agent": "OpenShorts-Webhook/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "ClipLinQ-Webhook/1.0"}
     if secret:
-        headers["X-OpenShorts-Signature"] = _sign_webhook(body, secret)
+        headers["X-ClipLinQ-Signature"] = _sign_webhook(body, secret)
     from security_utils import assert_public_url, UnsafeURLError
     loop = asyncio.get_event_loop()
     for attempt, delay in enumerate(WEBHOOK_RETRY_DELAYS, 1):
@@ -2053,19 +1535,8 @@ async def _notify_job_webhook(job_id):
 
 
 async def _settle_reservation(job_id, job=None):
-    if not BILLING_ENABLED:
-        return
-    job = job if job is not None else (jobs.get(job_id) or {})
-    reservation_id = job.get('reservation_id')
-    if not reservation_id:
-        return
-    try:
-        if job.get('status') == 'completed':
-            await cloud.metering.commit_reservation(reservation_id)
-        else:
-            await cloud.metering.release_reservation(reservation_id)
-    except Exception as e:
-        print(f"⚠️  Reservation settle error for {job_id}: {e}")
+    """No-op: no metering ledger to settle in self-host."""
+    return
 
 def _owned_by(record, uid: str) -> bool:
     owner = record.get('user_id') if isinstance(record, dict) else None
@@ -2179,35 +1650,15 @@ async def lifespan(app: FastAPI):
     # Start worker and cleanup
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
-    if BILLING_ENABLED:
-        await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
-        # Account erasure lives in cloud/, which can't import app.py; hand it the
-        # one thing only this module can do — wipe the local working files.
-        cloud.account.register_local_purge(_purge_local_jobs_for_user)
-        # Autopilot: watch connected YouTube channels for new videos. Paused
-        # while this instance drains so only the new container submits jobs.
-        cloud.autopilot.start(app, is_active=lambda: not _draining)
-        # Welcome / first-clip / win-back emails (cloud/lifecycle.py).
-        cloud.lifecycle.start(is_active=lambda: not _draining)
-        # Nag on Telegram while the residential proxy is down/out of credits —
-        # a single job-failure alert is easy to miss and ingest stays broken
-        # until someone tops the balance up.
-        asyncio.create_task(_alerts.proxy_watch_loop())
-    else:
-        # Self-host automation pipeline (pipeline/, docs/PIPELINE.md).
-        app.state.pipeline_jobs = jobs
-        _pipeline.start(app, output_root=OUTPUT_DIR, is_active=lambda: not _draining)
+    # Self-host automation pipeline (pipeline/, docs/PIPELINE.md).
+    app.state.pipeline_jobs = jobs
+    _pipeline.start(app, output_root=OUTPUT_DIR, is_active=lambda: not _draining)
     yield
     # Cleanup (optional: cancel worker)
 
 app = FastAPI(lifespan=lifespan)
 
-# Cloud mode: attach middleware + routers at import time (before the app serves).
-if BILLING_ENABLED:
-    cloud.setup_sync(app)
-
-# MCP server (/mcp): the pipeline as agent-callable tools. Works in both modes —
-# cloud requires an osk_ API key, self-host keeps BYOK (see mcp_server.py).
+# MCP server (/mcp): the pipeline as agent-callable tools (BYOK, see mcp_server.py).
 import mcp_server as _mcp_server
 app.include_router(_mcp_server.router)
 
@@ -2218,15 +1669,14 @@ app.include_router(_free_tools.router)
 
 # Self-host automation pipeline: /api/pipeline/* (see docs/PIPELINE.md).
 import pipeline as _pipeline
-if not BILLING_ENABLED:
-    app.include_router(_pipeline.router)
-    app.include_router(_pipeline.callback_router)
+app.include_router(_pipeline.router)
+app.include_router(_pipeline.callback_router)
 
-# Enable CORS for frontend. Cloud mode locks this down to the configured origins;
-# self-host keeps the permissive wildcard it has always used.
+# Enable CORS for frontend — permissive wildcard (no cloud multi-tenant origins
+# to lock down).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cloud.settings.allowed_origins if BILLING_ENABLED else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2316,33 +1766,18 @@ class _TimedLog(list):
 
 
 def _visible_logs_timed(logs):
-    """(lines, times) to surface to the client; see _visible_logs."""
+    """(lines, times) to surface to the client — self-host shows the full
+    pipeline output so people running their own instance can debug."""
     times = getattr(logs, "times", None)
     if times is not None and len(times) != len(logs):
         times = None
-    if not BILLING_ENABLED or DEBUG_LOGS:
-        return list(logs), list(times) if times is not None else None
-    from log_view import friendly_logs_timed
-    pairs = friendly_logs_timed(logs, times)
-    return [p[0] for p in pairs], ([p[1] for p in pairs] if times is not None else None)
+    return list(logs), list(times) if times is not None else None
 
 
 def _visible_logs(logs):
-    """Logs to surface to the client.
-
-    Self-host (BILLING off) shows the full pipeline output so people running
-    their own instance can debug. Cloud shows a curated whitelist view
-    (log_view.friendly_logs): plain progress for normal users — transcription
-    percentage, clip counters — with no file paths, model names or pipeline
-    internals.
-
-    DEBUG_LOGS=true forces the full output even under billing — for local dev
-    where you run in paid mode but still want the raw logs.
-    """
-    if not BILLING_ENABLED or DEBUG_LOGS:
-        return logs
-    from log_view import friendly_logs
-    return friendly_logs(logs)
+    """Logs to surface to the client — self-host shows the full pipeline
+    output so people running their own instance can debug."""
+    return logs
 
 
 def enqueue_output(out, job_id):
@@ -2371,15 +1806,8 @@ def enqueue_output(out, job_id):
                         pass
                     continue
                 if decoded_line.startswith("PROXY_ROUTE="):
-                    # Which download attempt won and why the free ones failed;
-                    # persisted at job end (cloud/proxy_ledger). Not shown to clients.
-                    try:
-                        from cloud import proxy_ledger as _pl
-                        route = _pl.parse_route_line(decoded_line)
-                        if route is not None and job_id in jobs:
-                            jobs[job_id]['proxy_route'] = route
-                    except Exception:
-                        pass
+                    # Which download attempt won and why the free ones failed.
+                    # Not shown to clients; nothing persists it in self-host.
                     continue
                 print(f"📝 [Job Output] {decoded_line}")
                 if job_id in jobs:
@@ -2479,11 +1907,9 @@ async def run_job(job_id, job_data):
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
-            # Self-host: silent AWS S3 backup. Cloud mode stores to R2 instead
-            # (see _archive_managed_job), so skip the redundant/paid AWS upload.
-            if not BILLING_ENABLED:
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
+            # Silent AWS S3 backup (optional; no-op without AWS_S3_BUCKET configured).
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
             
             # Find result JSON
             json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
@@ -2550,12 +1976,10 @@ async def health_ready():
 async def get_config():
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
-        "billingEnabled": BILLING_ENABLED,
-        "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
-        # Self-host only: tells the dashboard the Gemini key is optional
-        # because the moment picker runs on an OpenAI-compatible server.
-        "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Tells the dashboard the Gemini key is optional because the moment
+        # picker runs on an OpenAI-compatible server instead.
+        "localLlm": llm_backend.describe(),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -2620,11 +2044,6 @@ async def _quality_gate(url: str, force_low: bool):
 
 async def _drop_unstarted_job(reservation_id, job_output_dir):
     """Undo a submission refused after its minutes were reserved."""
-    if reservation_id:
-        try:
-            await _metering.release_reservation(reservation_id)
-        except Exception as e:
-            print(f"⚠️ Could not release reservation {reservation_id}: {e}")
     shutil.rmtree(job_output_dir, ignore_errors=True)
 
 
@@ -2696,8 +2115,6 @@ def _upload_url_base(request):
 async def create_upload(request: Request):
     """Reserve an upload slot. Body (JSON, optional): {"filename": "..."}."""
     user_id = await _owner_id(request)
-    if BILLING_ENABLED and user_id is None:
-        raise HTTPException(status_code=401, detail="Sign in or use an API key to upload")
     try:
         body = await request.json()
     except Exception:
@@ -2758,9 +2175,9 @@ async def put_upload(upload_id: str, request: Request):
 
 @app.delete("/api/uploads/{upload_id}")
 async def delete_upload(upload_id: str, request: Request):
-    """Drop a slot and its file before it expires (owner only in cloud mode)."""
+    """Drop a slot and its file before it expires."""
     slot = pending_uploads.get(upload_id)
-    if not slot or (BILLING_ENABLED and slot.get("user_id") != await _owner_id(request)):
+    if not slot:
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
     pending_uploads.pop(upload_id, None)
     try:
@@ -2789,7 +2206,7 @@ def _sweep_pending_uploads(now=None):
 def _take_pending_upload(upload_id, user_id):
     """The completed upload for this caller, or an HTTPException."""
     slot = pending_uploads.get(upload_id)
-    if not slot or (BILLING_ENABLED and slot.get("user_id") != user_id):
+    if not slot:
         raise HTTPException(status_code=404, detail="Unknown or expired upload_id")
     if not slot.get("complete") or not os.path.exists(slot["path"]):
         raise HTTPException(status_code=409, detail="Upload not received yet: PUT the video to upload_url first")
@@ -2847,10 +2264,10 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
-        # Self-host with an OpenAI-compatible server configured needs no
-        # Google key for the core pipeline: the moment picker runs there and
-        # the frame-based stages degrade on their own (layout_picker returns
+    if not api_key and not llm_backend.active():
+        # With an OpenAI-compatible server configured, no Google key is needed
+        # for the core pipeline: the moment picker runs there and the
+        # frame-based stages degrade on their own (layout_picker returns
         # "none", silent videos fail with a message that says why).
         raise gemini_missing_error()
 
@@ -3283,59 +2700,22 @@ def _locate_source(job_id: str):
     return None
 
 
-# How long a signed source URL stays valid. Long enough to survive an editing
-# session and a page reload, short enough that a link leaked through a log, a
-# referer or a shared screenshot is dead by the time anyone tries it.
-SOURCE_URL_TTL_SECONDS = int(os.environ.get("SOURCE_URL_TTL_SECONDS", "21600"))
-
-
-def _source_signature(job_id: str, exp: int) -> str:
-    """HMAC tying a job id to an expiry, keyed on the app's JWT secret."""
-    secret = (_cloud_config.settings.jwt_secret if BILLING_ENABLED else "") or ""
-    msg = f"{job_id}:{exp}".encode()
-    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()[:32]
-
-
 def _job_record(job_id: str):
     """The in-memory job record, or what the shared disk says about it."""
     return jobs.get(job_id) or _job_view_from_disk(job_id)
 
 
 def _signed_source_url(job_id: str) -> str:
-    """The URL to hand a `<video>` tag for this job's source.
-
-    Every place that returns a source URL to the browser must go through here:
-    a caller that builds the bare path instead ships a player that cannot
-    authenticate, and the clip editor's source monitor 404s in cloud while
-    working perfectly in self-host and in every test.
-    """
-    if not BILLING_ENABLED:
-        return f"/api/source/{job_id}"
-    exp = int(time.time()) + SOURCE_URL_TTL_SECONDS
-    return f"/api/source/{job_id}?exp={exp}&sig={_source_signature(job_id, exp)}"
+    """The URL to hand a `<video>` tag for this job's source. No user model,
+    so no signing: the plain path is always open by job id."""
+    return f"/api/source/{job_id}"
 
 
 @app.get("/api/source-url/{job_id}")
 async def get_source_url(job_id: str, request: Request):
-    """Mint a short-lived signed URL for this job's source video.
-
-    A `<video src>` cannot carry an Authorization header, which is why
-    /api/source was left open in the first place. So the owner asks for a
-    capability URL here, with the bearer token, and hands the player that.
-    """
-    record = _job_record(job_id)
-    if record is None:
-        # No record means no owner to check, and minting anyway would hand out
-        # a working key to whoever asked: the one door in this design that
-        # gives a capability without asking who you are. A real job resolves
-        # here (metadata recovers it, an in-flight one has a manifest naming
-        # its owner), so the only callers this turns away are asking about a
-        # job that does not exist. Off billing there is nothing to protect and
-        # the self-host preview must keep working.
-        if BILLING_ENABLED:
-            raise HTTPException(status_code=404, detail="Source not found")
-    else:
-        await _assert_job_owner(request, record)
+    """A `<video src>` cannot carry an Authorization header, which is why
+    /api/source is left open by job id in the first place; this just hands
+    back that same plain URL for callers that ask for one explicitly."""
     return {"url": _signed_source_url(job_id)}
 
 
@@ -3346,27 +2726,9 @@ async def get_source_video(job_id: str, request: Request,
     the clip editor's source monitor.
 
     Uploaded sources are blob URLs in the browser and don't survive a reload,
-    so the recovered session points the preview here instead.
-
-    This one endpoint serves the untouched original, which for a URL job is the
-    file we downloaded. Left open it is a public downloader wearing a UUID, so
-    a cloud job with an owner needs either a signed URL from /api/source-url or
-    a bearer token on the request. Self-host and ownerless BYOK jobs are
-    unchanged: there is no owner to check and no secret to sign with.
+    so the recovered session points the preview here instead. No user model,
+    so this is open by (unguessable UUID) job id.
     """
-    signed = (
-        BILLING_ENABLED and sig
-        and exp > time.time()
-        and hmac.compare_digest(sig, _source_signature(job_id, exp))
-    )
-    # Gated on BILLING_ENABLED, not just on `signed`: _job_record falls through
-    # to _job_view_from_disk, which rescans the whole output directory. Off
-    # billing there is no owner to find, so that scan would run on every single
-    # preview load and buy nothing.
-    if not signed and BILLING_ENABLED:
-        record = _job_record(job_id)
-        if record is not None:
-            await _assert_job_owner(request, record)
     source_path = _locate_source(job_id)
     if not source_path:
         raise HTTPException(status_code=404, detail="Source not found")
@@ -3424,191 +2786,24 @@ async def download_all_clips(job_id: str, request: Request):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"openshorts_clips_{job_id[:8]}.zip",
+        filename=f"cliplinq_clips_{job_id[:8]}.zip",
         background=BackgroundTask(os.remove, zip_path),
     )
 
 
-# --- Project restore (paid mode) --------------------------------------------
-# Re-hydrates an archived project from R2 back into output/{job_id}/ so every
-# edit endpoint works on it again. Restored files land with a fresh mtime, so
-# the retention clock restarts; re-restoring after a purge is cheap.
-_restore_locks: Dict[str, asyncio.Lock] = {}
-# Job ids are uuid4 strings; anything else under /videos is not a job dir
-# (thumbnails, stray probes) and must not reach the database.
-_JOB_ID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
-
-
-@app.post("/api/projects/{job_id}/restore")
-async def restore_project(job_id: str, request: Request):
-    if not BILLING_ENABLED:
-        raise HTTPException(status_code=404, detail="Not found")
-    from sqlalchemy import select
-    from cloud.auth import get_current_user_required
-    from cloud.models import Project
-    from cloud import database as cloud_db, storage as cloud_storage
-
-    user = await get_current_user_required(request)
-    async with cloud_db.session() as s:
-        proj = (await s.execute(
-            select(Project).where(Project.job_id == job_id)
-        )).scalar_one_or_none()
-    if proj is None or str(proj.user_id) != str(user.id):
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    await _restore_job_files(job_id, proj, str(user.id))
-    return {
-        "job_id": job_id,
-        "status": "completed",
-        "result": jobs[job_id]['result'],
-        "project_state": proj.state,
-        "title": proj.title,
-    }
-
-
-async def _restore_job_files(job_id: str, proj, user_id: str) -> bool:
-    """Bring a project's working files back from R2 and register the job.
-
-    The ownership check is the caller's job: ``restore_project`` (the
-    endpoint) verifies the session, ``_restore_for_public_path`` serves files
-    that are public by job id anyway. Returns True when files were actually
-    pulled, False on the idempotent fast path (everything already on disk).
-    """
-    from cloud import storage as cloud_storage
-
-    pulled = False
-    # Per-job lock: a double click must not download the project twice.
-    lock = _restore_locks.setdefault(job_id, asyncio.Lock())
-    async with lock:
-        job_dir = os.path.join(OUTPUT_DIR, job_id)
-
-        # Idempotent fast path: everything the project needs is already on disk.
-        needed = {os.path.basename(proj.metadata_r2_key)}
-        for c in (proj.state or {}).get("clips", []):
-            for k in ("original_file", "server_file"):
-                if c.get(k):
-                    needed.add(c[k])
-        if os.path.isdir(job_dir) and all(
-            os.path.exists(os.path.join(job_dir, f)) for f in needed
-        ):
-            os.utime(job_dir, None)  # restart the retention clock
-        else:
-            prefix = cloud_storage.job_key(user_id, job_id, "")
-            keys = await asyncio.to_thread(cloud_storage.list_keys, prefix)
-            if not keys:
-                raise HTTPException(status_code=502,
-                                    detail="Project files are no longer available")
-            # Download into a temp dir first so a partial failure never leaves a
-            # half-restored job dir that the fast path would mistake for complete.
-            tmp_dir = job_dir + ".restoring"
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            os.makedirs(tmp_dir, exist_ok=True)
-            sem = asyncio.Semaphore(3)
-
-            async def _download(key):
-                fname = os.path.basename(key)
-                if not fname:
-                    return
-                async with sem:
-                    await asyncio.to_thread(
-                        cloud_storage.download_file, key, os.path.join(tmp_dir, fname))
-
-            try:
-                await asyncio.gather(*(_download(k) for k in keys))
-            except Exception as e:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise HTTPException(status_code=502, detail=f"Restore download failed: {e}")
-            # Owner sidecar keeps the multi-tenant guard after a server restart.
-            with open(os.path.join(tmp_dir, ".owner"), "w") as f:
-                f.write(user_id)
-            pulled = True
-            if os.path.isdir(job_dir):
-                for fname in os.listdir(tmp_dir):
-                    shutil.move(os.path.join(tmp_dir, fname), os.path.join(job_dir, fname))
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                os.utime(job_dir, None)
-            else:
-                os.rename(tmp_dir, job_dir)
-
-        # Register (or refresh) the in-memory job — same shape as
-        # _recover_jobs_from_disk, so every edit endpoint works unchanged.
-        json_files = glob.glob(os.path.join(job_dir, "*_metadata.json"))
-        if not json_files:
-            raise HTTPException(status_code=502, detail="Project metadata missing")
-        with open(json_files[0], 'r') as f:
-            data = json.load(f)
-        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-        clips = data.get('shorts', [])
-        for i, clip in enumerate(clips):
-            if not clip.get('video_url'):
-                clip['video_url'] = (
-                    f"/videos/{job_id}/"
-                    f"{_canonical_clip_file(job_dir, base_name, i)}")
-        jobs[job_id] = {
-            'status': 'completed',
-            'logs': _TimedLog(["♻️ Project restored from your library."]),
-            'output_dir': job_dir,
-            'user_id': user_id,
-            'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
-        }
-    if pulled:
-        print(f"♻️  Restored {job_id} from the library (working files were gone).")
-    return pulled
-
-
 async def _restore_for_public_path(job_id: str) -> bool:
-    """Restorer for the /videos mount: a miss under /videos/<job_id>/ pulls
-    the project back from R2 for its owner, without a session. Those files
-    are public by job id already (the mount has no auth), so this grants
-    nothing new; it only stops a reopened project's players from 404ing
-    while the API side is still restoring it. True means "look again".
-    """
-    if not BILLING_ENABLED or not _JOB_ID_RE.match(job_id or ""):
-        return False
-    from sqlalchemy import select
-    from cloud.models import Project
-    from cloud import database as cloud_db
-    async with cloud_db.session() as s:
-        proj = (await s.execute(
-            select(Project).where(Project.job_id == job_id)
-        )).scalar_one_or_none()
-    if proj is None:
-        return False
-    try:
-        await _restore_job_files(job_id, proj, str(proj.user_id))
-    except HTTPException as e:
-        print(f"⚠️  /videos restore of {job_id} failed: {e.detail}")
-        return False
-    except Exception as e:
-        print(f"⚠️  /videos restore of {job_id} failed: {e}")
-        return False
-    return True
+    """Restorer for the /videos mount. No durable off-disk archive to pull
+    from, so a miss under /videos/<job_id>/ stays a miss."""
+    return False
 
 
 async def _ensure_job_files(job_id: str, request: Request) -> bool:
-    """Make a completed job usable again after its working files vanished.
-
-    OUTPUT_DIR is not durable — a container restart or redeploy wipes it — so
-    endpoints that read a job's files would 404 on a project the user can still
-    see in their library. Pull it back from R2 on demand (same path as the
-    explicit /restore), so editing keeps working instead of dead-ending.
-
-    Returns True when the job is available afterwards. Never raises: callers
-    keep their own 404s for jobs that genuinely don't exist.
-    """
+    """Whether a job's working files are present on disk. OUTPUT_DIR is not
+    durable — a container restart or redeploy wipes it — so this is what
+    every edit endpoint checks before touching a job's files. Never raises:
+    callers keep their own 404s for jobs that genuinely don't exist."""
     job_dir = os.path.join(OUTPUT_DIR, job_id)
-    if job_id in jobs and glob.glob(os.path.join(job_dir, "*_metadata.json")):
-        return True
-    if not BILLING_ENABLED:
-        return False
-    try:
-        await restore_project(job_id, request)
-        return True
-    except HTTPException:
-        return False
-    except Exception as e:
-        print(f"⚠️  Auto-restore failed for {job_id}: {e}")
-        return False
+    return job_id in jobs and bool(glob.glob(os.path.join(job_dir, "*_metadata.json")))
 
 
 from editor import VideoEditor
@@ -3629,10 +2824,7 @@ async def edit_clip(
     req: EditRequest,
     request: Request,
 ):
-    # Cloud (paid) mode disables BYOK: ignore any body api_key so it can't skip
-    # the entitlement gate or metering (mirrors resolve_gemini ignoring the
-    # header). Self-host keeps BYOK — the body key wins there.
-    body_key = None if BILLING_ENABLED else req.api_key
+    body_key = req.api_key
     final_api_key = body_key or await resolve_gemini(request)
 
     if not final_api_key:
@@ -3647,11 +2839,7 @@ async def edit_clip(
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
 
-    # Meter the managed Gemini call so it can't be looped for free. Skip only for
-    # genuine BYOK (self-host body key) — in cloud, body_key is always None.
-    edit_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    reservation_id = None if body_key else await reserve_managed_action(
-        request, edit_minutes, req.job_id, "edit")
+    reservation_id = None
 
     try:
         # Resolve Input Path: Prefer explict input_filename from frontend (chaining edits)
@@ -3990,8 +3178,7 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
             "min_segment_seconds": recut.MIN_SEGMENT_SECONDS,
             "max_total_seconds": recut.MAX_TOTAL_SECONDS,
         },
-        "rerender_minutes": (max(1, math.ceil(total / 60.0))
-                             if BILLING_ENABLED else 0),
+        "rerender_minutes": 0,
     }
 
 
@@ -4120,10 +3307,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
                     "must stay within the original clip range."))
 
     total = recut.total_duration(segments)
-    rerender_minutes = (max(1, math.ceil(total / 60.0))
-                        if BILLING_ENABLED else 0)
-    reservation_id = await reserve_managed_action(
-        request, rerender_minutes, req.job_id, "rerender")
+    reservation_id = None
 
     v_transcript = (recut.virtual_transcript(transcript, segments)
                     if req.reapply_captions else None)
@@ -4473,13 +3657,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     framing = (clip.get('recipe') or {}).get('framing') or 'auto'
     force_strategy = _FRAMING_STRATEGIES.get(framing)
 
-    # A reframe re-renders the full cut from source — same work as a source-path
-    # rerender, so it meters the same.
-    total = recut.total_duration(segments)
-    rerender_minutes = (max(1, math.ceil(total / 60.0))
-                        if BILLING_ENABLED else 0)
-    reservation_id = await reserve_managed_action(
-        request, rerender_minutes, req.job_id, "reframe")
+    reservation_id = None
 
     # Every default clip ships with burned captions; re-rendering without them
     # would silently hand back a caption-less file.
@@ -4560,9 +3738,7 @@ async def proxy_render(request: Request):
     await require_managed_entitlement(request)
     import httpx
     body = await request.json()
-    render_minutes = _cloud_config.RENDER_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(
-        request, render_minutes, str(uuid.uuid4()), "render")
+    reservation_id = None
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(f"{RENDER_SERVICE_URL}/render", json=body)
@@ -4584,13 +3760,6 @@ async def proxy_render_status(render_id: str, request: Request):
     # The id goes into the upstream path: ids are uuids, nothing else passes.
     if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", render_id or ""):
         raise HTTPException(status_code=404, detail="Not found")
-    if BILLING_ENABLED:
-        # Only the account that started the render may poll it (and read its
-        # output URL). An id this instance never issued is refused rather than
-        # passed through.
-        if render_id not in _render_owners:
-            raise HTTPException(status_code=404, detail="Not found")
-        await _assert_job_owner(request, {"user_id": _render_owners[render_id]})
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{RENDER_SERVICE_URL}/render/{render_id}")
@@ -4624,9 +3793,7 @@ async def generate_effects_config(
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
 
-    # Meter the managed Gemini call (no-op for self-host).
-    fx_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, fx_minutes, req.job_id, "effects")
+    reservation_id = None
 
     try:
         # Resolve input path
@@ -4849,10 +4016,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # The dubbed path is the exception and keeps the charge: it runs a fresh
     # Whisper transcription over the translated audio, which is real work.
     is_dubbed = filename.startswith("translated_")
-    subtitle_minutes = (_cloud_config.subtitle_minutes_for(filename)
-                        if BILLING_ENABLED else 0)
-    reservation_id = await reserve_managed_action(
-        request, subtitle_minutes, req.job_id, "subtitle")
+    reservation_id = None
 
     try:
         # 1. Generate SRT — from the existing transcript, or a fresh
@@ -5069,10 +4233,7 @@ async def add_hook(req: HookRequest, request: Request):
         size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
         font_scale = size_map.get(req.size, 1.0)
 
-        # Meter the FFmpeg overlay re-encode (no-op for BYOK / self-host).
-        hook_minutes = _cloud_config.HOOK_MINUTES if BILLING_ENABLED else 0
-        reservation_id = await reserve_managed_action(
-            request, hook_minutes, req.job_id, "hook")
+        reservation_id = None
 
         try:
             # Run in thread pool
@@ -5452,13 +4613,6 @@ def _check_analytics_rate(user_id):
 async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
     api_key, forced_profile = await resolve_upload_post(request, None)
     if not api_key:
-        if BILLING_ENABLED:
-            # Signed-in free user (or no auth at all): social posting is
-            # paid-only in cloud, so there are no posts to measure either.
-            raise HTTPException(status_code=402, detail={
-                "error": "no_plan",
-                "message": "Social analytics needs an active plan.",
-            })
         raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
     if forced_profile:
         user = await _user_from_request(request)
@@ -5666,11 +4820,7 @@ async def thumbnail_upload(
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 buffer.write(chunk)
 
-    # Meter a fixed guard cost for the background download + Whisper transcription
-    # so an entitled user can't loop it for free. Settled when the job finishes.
-    transcribe_minutes = _cloud_config.TRANSCRIBE_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(
-        request, transcribe_minutes, session_id, "thumbnail_transcribe")
+    reservation_id = None
 
     # Initialize session
     thumbnail_sessions[session_id] = {
@@ -5791,9 +4941,7 @@ async def thumbnail_analyze(
                         raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                     buffer.write(chunk)
 
-    # Meter the managed Gemini analysis (no-op for self-host).
-    analyze_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, analyze_minutes, session_id, "thumbnail_analyze")
+    reservation_id = None
 
     try:
         # Run analysis in thread pool (skips Whisper if pre_transcript is available)
@@ -5927,14 +5075,6 @@ async def thumbnail_generate(
     if not api_key:
         raise gemini_missing_error()
 
-    # Image generation is the one expensive managed Gemini call — paid plans only.
-    if BILLING_ENABLED:
-        user = await _user_from_request(request)
-        if user is not None and user.plan == "free":
-            raise HTTPException(status_code=403, detail={
-                "error": "plan_required",
-                "message": "AI thumbnail generation is available on paid plans.",
-            })
     # The session carries someone's transcript, titles and frames: only its
     # owner may generate from it (and be billed for it).
     _sess = thumbnail_sessions.get(session_id)
@@ -5944,10 +5084,7 @@ async def thumbnail_generate(
     # Clamp count
     count = min(max(1, count), 6)
 
-    # Gemini image generation is the expensive managed call — meter it against the
-    # plan quota (a batch ≈ THUMBNAIL_MINUTES). No-op for BYOK / self-host.
-    thumb_minutes = _cloud_config.THUMBNAIL_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, thumb_minutes, session_id, "thumbnail")
+    reservation_id = None
 
     # Save optional uploaded images. basename() on the session id and filenames
     # keeps everything inside UPLOAD_DIR (no "../" escape from client input).
@@ -6266,9 +5403,7 @@ async def saasshorts_analyze(
     if not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
 
-    # Meter the managed Gemini research/analysis (no-op for self-host).
-    saas_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
-    reservation_id = await reserve_managed_action(request, saas_minutes, "saasshorts", "saasshorts_analyze")
+    reservation_id = None
 
     try:
         loop = asyncio.get_event_loop()

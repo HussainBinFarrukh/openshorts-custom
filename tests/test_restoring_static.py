@@ -87,9 +87,3 @@ def test_no_restorer_behaves_like_staticfiles(tmp_path):
     assert client.get(f"/videos/{JOB}/clip_1.mp4").status_code == 404
 
 
-def test_app_job_id_guard():
-    """The app-side restorer only hits the database for uuid-shaped ids."""
-    app_mod = pytest.importorskip("app")
-    assert app_mod._JOB_ID_RE.match(JOB)
-    for bad in ("thumbnails", "..", "cff3ad6c", "CFF3AD6C-C1E6-48E8-9A75-BE74F39779C5"):
-        assert not app_mod._JOB_ID_RE.match(bad)

@@ -17,13 +17,13 @@ jobs:
       # heavy ML stack (torch/ultralytics/mediapipe/faster-whisper) — the
       # pipeline modules import those lazily behind their feature gates, and
       # the tests exercise the gated-off paths. numpy+opencv cover the layout
-      # modules, fastapi/boto3/PyJWT/python-multipart cover importing app.py
-      # for the MCP endpoint tests, google-genai covers gemini_worker.
+      # modules, fastapi/boto3/python-multipart cover importing app.py for the
+      # MCP endpoint tests, google-genai covers gemini_worker.
       - name: Install test dependencies
         run: >
-          pip install pytest pillow httpx pydantic sqlalchemy greenlet numpy
+          pip install pytest pillow httpx pydantic numpy
           opencv-python-headless python-dotenv google-genai fastapi boto3
-          PyJWT email-validator python-multipart
+          python-multipart
       - name: Run tests
         run: pytest tests/ -v
 

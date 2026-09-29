@@ -587,37 +587,8 @@ async def handle_message(msg, tool_caller) -> Optional[dict]:
 # --------------------------------------------------------------------------- #
 # Transport endpoints
 # --------------------------------------------------------------------------- #
-def _billing_enabled() -> bool:
-    return os.environ.get("BILLING_ENABLED", "").lower() in ("1", "true", "yes")
-
-
-async def _authorized(request: Request) -> bool:
-    """Cloud mode requires a resolvable user (API key or JWT) before any RPC.
-
-    The internal endpoints would each reject anonymous calls anyway; failing
-    once here with a clear 401 is what lets MCP clients surface 'add your API
-    key' instead of a per-tool 402. Self-host stays open (BYOK)."""
-    if not _billing_enabled():
-        return True
-    from cloud.auth import get_current_user_optional
-    return (await get_current_user_optional(request)) is not None
-
-
 @router.post("/mcp")
 async def mcp_endpoint(request: Request):
-    if not await _authorized(request):
-        # OAuth-capable clients (claude.ai, ChatGPT) read resource_metadata off
-        # this header and run the login flow themselves; everyone else gets the
-        # API-key hint in the body.
-        from cloud import mcp_oauth
-        u = request.base_url
-        return JSONResponse(
-            {"error": "Authentication required. Connect with OAuth (claude.ai, ChatGPT) "
-                      "or pass an OpenShorts API key: Authorization: Bearer osk_... "
-                      "(create one in the dashboard)."},
-            status_code=401,
-            headers={"WWW-Authenticate": mcp_oauth.www_authenticate(f"{u.scheme}://{u.netloc}")},
-        )
     try:
         msg = json.loads(await request.body())
     except Exception:
