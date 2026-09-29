@@ -1651,6 +1651,8 @@ async def run_job_wrapper(job_id):
         # Autopilot bookkeeping + autopublish (before the generic clips-ready
         # email, which it replaces for its own jobs).
         await _autopilot_job_finished(job_id, job)
+        # Self-host pipeline: pick up clips from jobs it submitted.
+        await _pipeline_job_finished(job_id, job)
         # Fire the caller's webhook (after archive, so durable links exist).
         await _notify_job_webhook(job_id)
         # Operational alerting for managed jobs (proxy out of credits / failures).
@@ -1787,6 +1789,15 @@ async def _autopilot_job_finished(job_id, job):
         await cloud.autopilot.on_job_finished(job_id, job, reason)
     except Exception as e:
         print(f"⚠️  Autopilot completion error for {job_id}: {e}")
+
+
+async def _pipeline_job_finished(job_id, job):
+    if BILLING_ENABLED or not job:
+        return
+    try:
+        await _pipeline.on_job_finished(job_id, job)
+    except Exception as e:
+        print(f"⚠️  Pipeline completion error for {job_id}: {e}")
 
 
 async def _notify_clips_ready(job_id):
@@ -2182,6 +2193,10 @@ async def lifespan(app: FastAPI):
         # a single job-failure alert is easy to miss and ingest stays broken
         # until someone tops the balance up.
         asyncio.create_task(_alerts.proxy_watch_loop())
+    else:
+        # Self-host automation pipeline (pipeline/, docs/PIPELINE.md).
+        app.state.pipeline_jobs = jobs
+        _pipeline.start(app, output_root=OUTPUT_DIR, is_active=lambda: not _draining)
     yield
     # Cleanup (optional: cancel worker)
 
@@ -2200,6 +2215,12 @@ app.include_router(_mcp_server.router)
 # captions only, never the GPU) and the title/description/tag generator.
 import free_tools as _free_tools
 app.include_router(_free_tools.router)
+
+# Self-host automation pipeline: /api/pipeline/* (see docs/PIPELINE.md).
+import pipeline as _pipeline
+if not BILLING_ENABLED:
+    app.include_router(_pipeline.router)
+    app.include_router(_pipeline.callback_router)
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Workflow } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -24,6 +24,7 @@ import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
 import AutopilotTab from './components/AutopilotTab';
+import PipelineTab from './components/PipelineTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
@@ -866,7 +867,7 @@ function App() {
   // dropped so a reload does not keep forcing the tab.
   const [autopilotConnected, setAutopilotConnected] = useState(false);
   useEffect(() => {
-    const DEEP_LINK_TABS = ['autopilot', 'history', 'settings', 'thumbnails', 'dashboard'];
+    const DEEP_LINK_TABS = ['autopilot', 'pipeline', 'history', 'settings', 'thumbnails', 'dashboard'];
     const apply = () => {
       const hash = window.location.hash || '';
       if (!hash.startsWith('#app?')) return;
@@ -1145,6 +1146,8 @@ function App() {
     { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator', short: 'clips', primary: true },
     // Cloud only: it runs on the managed pipeline and the Upload-Post connection.
     ...(billingEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot', short: 'autopilot', isNew: true }] : []),
+    // Self-host only: the automation pipeline in pipeline/ (docs/PIPELINE.md).
+    ...(!billingEnabled ? [{ id: 'pipeline', ord: '02', icon: Workflow, label: 'Pipeline', short: 'pipeline', primary: true }] : []),
     { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
     { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
@@ -1887,6 +1890,15 @@ function App() {
                     <button onClick={() => setShowLogin(true)} className="btn-primary">sign in</button>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* View: Pipeline (self-host) */}
+          {activeTab === 'pipeline' && !billingEnabled && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
+                <PipelineTab />
               </div>
             </div>
           )}
