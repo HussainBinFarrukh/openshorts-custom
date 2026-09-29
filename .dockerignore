@@ -38,6 +38,14 @@ videos/
 # Model files (downloaded at build time)
 *.pt
 
+# Runtime data mounted as volumes (docker-compose.yml) or written by the
+# backend inside the bind-mounted repo (.:/app) — never part of the build
+# context. A stray blob file under .cache once broke buildx entirely
+# ("invalid file request"), and all three balloon the context needlessly.
+.cache/
+output/
+pipeline_data/
+
 # Secrets — never bake real credentials into the image (repo is public,
 # image may be pushed to a registry). Runtime env comes via compose env_file.
 .env

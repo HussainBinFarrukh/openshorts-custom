@@ -52,3 +52,7 @@ CLAUDE.local.md
 
 # Self-host automation pipeline state (SQLite, clips, reactions, renders)
 pipeline_data/
+
+# Personal machine overrides (GPU build args, local port remaps) — README's
+# GPU section documents creating this file per-host, never meant to be shared.
+docker-compose.override.yml
