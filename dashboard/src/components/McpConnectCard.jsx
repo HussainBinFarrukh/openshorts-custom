@@ -48,17 +48,17 @@ function buildClients({ cloud, url }) {
     },
     {
       id: 'claude-code', label: 'Claude Code', kind: 'code', lang: 'bash',
-      snippet: `claude mcp add --transport http openshorts ${url}${header}`,
+      snippet: `claude mcp add --transport http cliplinq ${url}${header}`,
       note: cloud ? 'Create a key below and paste it in place of osk_YOUR_KEY.' : 'No key needed on a self-hosted install.',
     },
     {
       id: 'claude-desktop', label: 'Claude Desktop', kind: 'code', lang: 'json',
-      snippet: `{\n  "mcpServers": {\n    "openshorts": {\n      "command": "npx",\n      "args": ${desktopArgs}\n    }\n  }\n}`,
+      snippet: `{\n  "mcpServers": {\n    "cliplinq": {\n      "command": "npx",\n      "args": ${desktopArgs}\n    }\n  }\n}`,
       note: 'Settings → Developer → Edit config (claude_desktop_config.json), then restart Claude.',
     },
     {
       id: 'cursor', label: 'Cursor', kind: 'code', lang: 'json',
-      snippet: `{\n  "mcpServers": {\n    "openshorts": {\n      "url": "${url}"${cursorHeaders}\n    }\n  }\n}`,
+      snippet: `{\n  "mcpServers": {\n    "cliplinq": {\n      "url": "${url}"${cursorHeaders}\n    }\n  }\n}`,
       note: 'Settings → MCP → Add new global MCP server (.cursor/mcp.json).',
     },
     {

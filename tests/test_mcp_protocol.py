@@ -36,7 +36,7 @@ class TestInitialize:
     def test_advertises_tools_capability(self):
         resp = _run({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         assert "tools" in resp["result"]["capabilities"]
-        assert resp["result"]["serverInfo"]["name"] == "openshorts"
+        assert resp["result"]["serverInfo"]["name"] == "cliplinq"
 
 
 class TestNotificationsAndErrors:

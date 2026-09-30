@@ -46,7 +46,7 @@ class TestStdioTransport:
 
     def test_initialize_reports_the_same_server(self, responses):
         result = responses[0]["result"]
-        assert result["serverInfo"]["name"] == "openshorts"
+        assert result["serverInfo"]["name"] == "cliplinq"
         assert result["protocolVersion"] == "2025-06-18"
 
     def test_tools_match_the_http_transport(self, responses):

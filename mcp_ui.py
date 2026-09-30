@@ -19,14 +19,14 @@ clips' absolute URLs and everything else is inline.
 """
 import json
 
-CLIP_PICKER_URI = "ui://openshorts/clip-picker"
+CLIP_PICKER_URI = "ui://cliplinq/clip-picker"
 MIME_TYPE = "text/html;profile=mcp-app"
 
 RESOURCES = [
     {
         "uri": CLIP_PICKER_URI,
         "name": "clip-picker",
-        "title": "OpenShorts clip picker",
+        "title": "ClipLinQ clip picker",
         "description": (
             "Interactive picker for a job's finished clips: preview each 9:16 "
             "clip, select the keepers and publish them to TikTok, Instagram or "
@@ -71,7 +71,7 @@ button:disabled{opacity:.4;cursor:default}
 </style>
 </head>
 <body>
-<h1 id="hd">OpenShorts clips</h1>
+<h1 id="hd">ClipLinQ clips</h1>
 <div class="grid" id="grid"><span class="empty">Waiting for clip data…</span></div>
 <div class="bar" id="bar" hidden>
   <span class="chip on" data-p="tiktok">TikTok</span>
@@ -81,7 +81,7 @@ button:disabled{opacity:.4;cursor:default}
 </div>
 <div class="msg" id="msg"></div>
 <script>
-var inline = __OPENSHORTS_DATA__;
+var inline = __CLIPLINQ_DATA__;
 var state = null;
 var selected = {};
 
@@ -192,4 +192,4 @@ def clip_picker_html(data=None) -> str:
     """
     payload = "null" if data is None else json.dumps(
         data, ensure_ascii=False).replace("<", "\\u003c")
-    return _TEMPLATE.replace("__OPENSHORTS_DATA__", payload)
+    return _TEMPLATE.replace("__CLIPLINQ_DATA__", payload)

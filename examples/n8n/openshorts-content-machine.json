@@ -1,9 +1,9 @@
 {
-  "name": "Clip new YouTube uploads into viral shorts with open-source OpenShorts and publish after Telegram approval",
+  "name": "Clip new YouTube uploads into viral shorts with open-source ClipLinQ and publish after Telegram approval",
   "nodes": [
     {
       "parameters": {
-        "content": "## Clip your YouTube channel and publish after approval\n\n**Who's it for**\nCreators and small teams who publish long videos and want shorts from them without\nhanding the publish button to a machine. It suits anyone who already runs n8n and\ndoes not want to build the clipping and the multi-platform posting themselves.\n\n**What it does**\nOnce a day it reads your channel RSS feed and picks one video: your newest upload,\nor the next unprocessed one from the back catalogue. It sends that video to\nOpenShorts, which returns finished 9:16 clips with subtitles through a webhook, so\nthere is no polling loop. Each clip arrives in Telegram with Publish and Skip\nbuttons. Approved clips are scheduled one per day to the social accounts connected\nin your OpenShorts account, and every Sunday the workflow reports the impressions\nand best post of what it published.\n\n**How to set up**\n1. Create an API key at openshorts.app and add it as a Header Auth credential\n   (Name: Authorization, Value: Bearer osk_...).\n2. Create a Telegram bot with @BotFather and add the Telegram credential.\n3. Fill the three **Settings** nodes with your YouTube channel id and Telegram chat id.\n4. Copy the production URL of the *Clips ready* webhook node into the\n   `webhook_url` field of *Start OpenShorts job*.\n\n**Requirements**\nAn OpenShorts account (free tier covers 20 minutes of video a month, paid plans\nfrom $12/month) or a self-hosted instance, a Telegram bot, and an n8n reachable\nover https so Telegram can register the approval buttons.\n\n**How to customize**\nChange the schedule to clip more or less often, edit the platforms list in\n*Schedule social post*, widen the posting rhythm in *Pick next free slot*, or\nreplace the Telegram approval with your own review step.",
+        "content": "## Clip your YouTube channel and publish after approval\n\n**Who's it for**\nCreators and small teams who publish long videos and want shorts from them without\nhanding the publish button to a machine. It suits anyone who already runs n8n and\ndoes not want to build the clipping and the multi-platform posting themselves.\n\n**What it does**\nOnce a day it reads your channel RSS feed and picks one video: your newest upload,\nor the next unprocessed one from the back catalogue. It sends that video to your\nself-hosted ClipLinQ instance, which returns finished 9:16 clips with subtitles\nthrough a webhook, so there is no polling loop. Each clip arrives in Telegram with\nPublish and Skip buttons. Approved clips are scheduled one per day via your own\nUpload-Post account, and every Sunday the workflow reports the impressions and\nbest post of what it published.\n\n**How to set up**\n1. Run ClipLinQ (Docker, see the main README) and add a Header Auth credential\n   for your Gemini key (Name: X-Gemini-Key, Value: your key).\n2. Create a Telegram bot with @BotFather and add the Telegram credential.\n3. Fill the three **Settings** nodes with your YouTube channel id, Telegram chat\n   id, and your ClipLinQ instance's base URL (`http://localhost:8000` by default).\n4. Copy the production URL of the *Clips ready* webhook node into the\n   `webhook_url` field of *Start ClipLinQ job*.\n\n**Requirements**\nA running ClipLinQ instance (self-hosted, MIT, free — see the main README), your\nown Gemini and Upload-Post API keys, a Telegram bot, and an n8n reachable over\nhttps so Telegram can register the approval buttons.\n\n**How to customize**\nChange the schedule to clip more or less often, edit the platforms list in\n*Schedule social post*, widen the posting rhythm in *Pick next free slot*, or\nreplace the Telegram approval with your own review step.",
         "height": 900,
         "width": 460,
         "color": 3
@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "content": "## ACT 1 \u2014 Watch the channel (daily)\n\nOnce a day this branch reads your channel's RSS feed and picks **one** video to clip: a new upload if there is one, otherwise the next unprocessed video from your back catalog (newest first). One video per day keeps your quota burn predictable.\n\n**Setup**: put your channel id in the *Channel RSS feed* node (`https://www.youtube.com/feeds/videos.xml?channel_id=UC...`). Find it at youtube.com \u2192 your channel \u2192 About \u2192 Share \u2192 Copy channel ID.\n\nIf OpenShorts answers 402 (out of minutes) the machine pauses and tells you on Telegram instead of failing silently.",
+        "content": "## ACT 1 \u2014 Watch the channel (daily)\n\nOnce a day this branch reads your channel's RSS feed and picks **one** video to clip: a new upload if there is one, otherwise the next unprocessed video from your back catalog (newest first). One video per day keeps the pipeline predictable.\n\n**Setup**: put your channel id in the *Channel RSS feed* node (`https://www.youtube.com/feeds/videos.xml?channel_id=UC...`). Find it at youtube.com \u2192 your channel \u2192 About \u2192 Share \u2192 Copy channel ID.\n\nIf ClipLinQ rejects the job the machine pauses and tells you on Telegram instead of failing silently.",
         "height": 420,
         "width": 400,
         "color": 7
@@ -83,7 +83,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://api.openshorts.app/api/process",
+        "url": "http://localhost:8000/api/process",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
@@ -142,7 +142,7 @@
     {
       "parameters": {
         "chatId": "={{ $('Settings').first().json.telegram_chat_id }}",
-        "text": "\u26a0\ufe0f Autopilot paused: OpenShorts rejected the job (most likely you're out of minutes this month). The video was NOT marked as processed, so it will be retried tomorrow. Top up or upgrade at https://www.openshorts.app/",
+        "text": "\u26a0\ufe0f Autopilot paused: ClipLinQ rejected the job (check the instance's logs \u2014 a missing Gemini key or too many concurrent jobs are the usual causes). The video was NOT marked as processed, so it will be retried tomorrow.",
         "additionalFields": {}
       },
       "id": "tg-quota",
@@ -445,7 +445,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://api.openshorts.app/api/social/post",
+        "url": "http://localhost:8000/api/social/post",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
@@ -491,7 +491,7 @@
     {
       "parameters": {
         "chatId": "={{ $('Parse button').first().json.chat_id }}",
-        "text": "=\u26a0\ufe0f Could not schedule that clip: {{ $json.error && $json.error.message ? $json.error.message : 'posting failed' }}. Make sure your social accounts are connected in your OpenShorts account page.",
+        "text": "=\u26a0\ufe0f Could not schedule that clip: {{ $json.error && $json.error.message ? $json.error.message : 'posting failed' }}. Make sure your Upload-Post key is configured and your social accounts are connected there.",
         "additionalFields": {}
       },
       "id": "tg-post-failed",
@@ -569,7 +569,7 @@
     },
     {
       "parameters": {
-        "url": "https://api.openshorts.app/api/social/analytics/impressions",
+        "url": "http://localhost:8000/api/social/analytics/impressions",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendQuery": true,
@@ -603,7 +603,7 @@
     },
     {
       "parameters": {
-        "url": "https://api.openshorts.app/api/social/analytics/posts",
+        "url": "http://localhost:8000/api/social/analytics/posts",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendQuery": true,
@@ -666,7 +666,7 @@
     },
     {
       "parameters": {
-        "url": "https://api.openshorts.app/api/social/scheduled",
+        "url": "http://localhost:8000/api/social/scheduled",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {}

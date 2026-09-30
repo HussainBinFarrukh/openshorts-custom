@@ -8,17 +8,11 @@ a dependency for them.
 
 Tools don't reimplement anything: each one is an in-process HTTP call back into
 this same app (httpx ASGITransport) with the caller's auth headers forwarded.
-Cloud mode therefore meters, gates and scopes agent calls exactly like
-dashboard calls — an ``osk_`` API key IS the user (see cloud/api_keys.py).
-Self-host keeps its BYOK semantics: no key required, ``X-Gemini-Key`` /
-env fallbacks apply unchanged.
+No user model: no key required, ``X-Gemini-Key`` / env fallbacks apply
+unchanged, same as every other endpoint.
 
 Connect with any MCP client, e.g.:
-    claude mcp add --transport http openshorts https://mcp.openshorts.app/mcp \
-        --header "Authorization: Bearer osk_..."
-
-(mcp.openshorts.app is a domain alias of the API app; api.openshorts.app/mcp
-serves the identical endpoint.)
+    claude mcp add --transport http cliplinq http://localhost:8000/mcp
 """
 import json
 import os
@@ -33,11 +27,11 @@ import mcp_ui
 router = APIRouter()
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "openshorts", "title": "OpenShorts", "version": "1.0.0"}
+SERVER_INFO = {"name": "cliplinq", "title": "ClipLinQ", "version": "1.0.0"}
 INSTRUCTIONS = (
-    "OpenShorts turns long videos (YouTube URLs or direct video files) into "
+    "ClipLinQ turns long videos (YouTube URLs or direct video files) into "
     "viral-ready vertical clips. When the user gives you a video URL, hand it "
-    "to process_video exactly as written: OpenShorts downloads, transcribes "
+    "to process_video exactly as written: ClipLinQ downloads, transcribes "
     "and analyses the video on its own servers. Do NOT try to open, fetch, "
     "search for, summarise or transcribe the URL yourself first; you cannot "
     "reach the video and it is not needed. Typical flow: process_video -> "
@@ -60,7 +54,7 @@ TOOLS = [
         "name": "process_video",
         "title": "Process a video into short clips",
         "description": (
-            "Start clipping a video from its URL. OpenShorts downloads the "
+            "Start clipping a video from its URL. ClipLinQ downloads the "
             "source itself, transcribes it, finds the most viral moments with AI "
             "and renders vertical (9:16) clips. Captions and the AI hook line are "
             "burned by default; pass captions=false or auto_hook=false to skip either. "
@@ -127,7 +121,7 @@ TOOLS = [
                 },
                 "webhook_secret": {
                     "type": "string",
-                    "description": "Optional secret; the webhook body is then HMAC-SHA256 signed (X-OpenShorts-Signature).",
+                    "description": "Optional secret; the webhook body is then HMAC-SHA256 signed (X-ClipLinQ-Signature).",
                 },
                 "force_low_quality": {
                     "type": "boolean",
@@ -326,7 +320,7 @@ def _client(request: Request) -> httpx.AsyncClient:
     headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARD_HEADERS}
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=request.app, raise_app_exceptions=False),
-        base_url="http://openshorts.internal",
+        base_url="http://cliplinq.internal",
         headers=headers,
         timeout=300.0,
     )
@@ -553,7 +547,7 @@ async def handle_message(msg, tool_caller) -> Optional[dict]:
         return _rpc_result(msg_id, {"resourceTemplates": []})
     if method == "resources/read":
         uri = (msg.get("params") or {}).get("uri") or ""
-        # Per-call URIs (ui://openshorts/clip-picker/<job>) resolve to the same
+        # Per-call URIs (ui://cliplinq/clip-picker/<job>) resolve to the same
         # template; the data those carried was baked into the tool result.
         if uri == mcp_ui.CLIP_PICKER_URI or uri.startswith(mcp_ui.CLIP_PICKER_URI + "/"):
             return _rpc_result(msg_id, {"contents": [{

@@ -1,13 +1,12 @@
 {
-  "name": "openshorts",
+  "name": "cliplinq",
   "version": "1.1.0",
-  "description": "Turn long videos (podcasts, webinars, streams) into vertical 9:16 clips with subtitles, re-cut them, and publish them to TikTok, Instagram Reels and YouTube Shorts via the OpenShorts API or MCP server.",
+  "description": "Turn long videos (podcasts, webinars, streams) into vertical 9:16 clips with subtitles, re-cut them, and publish them to TikTok, Instagram Reels and YouTube Shorts via the ClipLinQ API or MCP server.",
   "author": {
-    "name": "OpenShorts",
-    "url": "https://www.openshorts.app/"
+    "name": "ClipLinQ"
   },
-  "homepage": "https://github.com/mutonby/openshorts/tree/main/skills/openshorts",
-  "repository": "https://github.com/mutonby/openshorts",
+  "homepage": "https://github.com/HussainBinFarrukh/openshorts-custom/tree/main/skills/openshorts",
+  "repository": "https://github.com/HussainBinFarrukh/openshorts-custom",
   "license": "MIT",
   "keywords": [
     "video",

@@ -1,30 +1,12 @@
-# OpenShorts HTTP reference
+# ClipLinQ HTTP reference
 
-Base URL: `https://api.openshorts.app` (self-hosted: `http://localhost:8000`).
-Every call carries `Authorization: Bearer osk_...` or `X-API-Key: osk_...`.
-Self-hosted instances need no key, but do need a Gemini key, either in the
-server's environment or as an `X-Gemini-Key` header.
+Base URL: `http://localhost:8000` (or wherever you've deployed your instance).
+Self-hosted only — no account, no API key server-side. You do need a Gemini
+key, either in the server's environment or as an `X-Gemini-Key` header, and
+an Upload-Post key (`X-Upload-Post-Key` header) to publish.
 
-The MCP server at `https://mcp.openshorts.app/mcp` wraps exactly these
-endpoints, forwarding your auth headers, so the two paths cannot drift.
-
-## Quota
-
-`GET /api/me`
-
-```json
-{
-  "plan": "free",
-  "entitled": false,
-  "minutes": { "plan_allowance": 20, "plan_used": 4, "plan_remaining": 16,
-               "topup_remaining": 0, "remaining": 16 },
-  "upload_post_profile": null
-}
-```
-
-`upload_post_profile` is null when no social account is connected, which means
-publishing will fail. On a self-hosted instance this endpoint is not mounted at
-all and returns 404, which simply means there is no quota to report.
+The MCP server at `/mcp` wraps exactly these endpoints, forwarding your
+BYOK headers, so the two paths cannot drift.
 
 ## Start a job
 
@@ -40,7 +22,7 @@ a `file` part to upload a local video instead):
   "target_clips": 4,
   "clip_min_seconds": 15,
   "clip_max_seconds": 60,
-  "webhook_url": "https://example.com/hooks/openshorts",
+  "webhook_url": "https://example.com/hooks/cliplinq",
   "webhook_secret": "change-me",
   "force_low_quality": false
 }
@@ -68,9 +50,8 @@ Quality gate, also HTTP 200:
 
 Ask the user, then resubmit the identical body with `force_low_quality: true`.
 
-Errors: **402** `{"detail": {"error": "quota_exceeded", "minutes_required": 12,
-"minutes_remaining": 3}}`, **429** too many jobs already running, **400** the
-source duration could not be determined.
+Errors: **429** too many jobs already running (`MAX_CONCURRENT_JOBS`), **400**
+the source duration could not be determined or the Gemini key is missing.
 
 ## Poll a job
 
@@ -92,17 +73,16 @@ Fired once per job, on success and on failure, so a flow never hangs:
   "event": "job.completed",
   "job_id": "0f0a...",
   "status": "completed",
-  "clips": [ { "index": 0, "title": "...", "video_url": "...", "download_url": "..." } ]
+  "clips": [ { "index": 0, "title": "...", "video_url": "..." } ]
 }
 ```
 
 A failed job sends `"event": "job.failed"` with an `error` string and no clips.
-`download_url` is a presigned link valid for 24 hours (hosted service only).
 
 The URL must be public HTTPS; it is validated at submit time and re-resolved at
 delivery time, so a URL that points at a private address is refused. With a
 `webhook_secret`, the **raw request body** is signed HMAC-SHA256 and sent as
-`X-OpenShorts-Signature: sha256=<hex>`. Verify against the raw bytes, not
+`X-ClipLinQ-Signature: sha256=<hex>`. Verify against the raw bytes, not
 against a re-serialized object:
 
 ```javascript
@@ -162,4 +142,4 @@ Analytics of what was published: `GET /api/social/analytics` (profile totals),
 `GET /api/social/analytics/posts` (per post), and
 `GET /api/social/analytics/impressions` (windowed, e.g. `?period=last_week`).
 
-Full generated API docs: <https://api.openshorts.app/docs>.
+Full generated API docs: `http://localhost:8000/docs` on your own instance.

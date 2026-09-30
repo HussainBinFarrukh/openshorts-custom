@@ -11,6 +11,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 
 # Temporary files / runtime dirs
 temp_*

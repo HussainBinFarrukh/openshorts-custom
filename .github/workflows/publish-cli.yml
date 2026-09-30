@@ -1,7 +1,7 @@
 name: Publish CLI to PyPI
 
 # Push a tag cli-vX.Y.Z (matching `version` in cli/pyproject.toml) to publish
-# the `openshorts` CLI. Uses PyPI Trusted Publishing (OIDC): no API token.
+# the `cliplinq` CLI. Uses PyPI Trusted Publishing (OIDC): no API token.
 on:
   push:
     tags:
@@ -35,7 +35,7 @@ jobs:
       - name: Smoke test the wheel
         run: |
           pip install dist/*.whl
-          openshorts --help
+          cliplinq --help
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
