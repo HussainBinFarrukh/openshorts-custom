@@ -25,8 +25,9 @@ surfaces against your own running instance; prefer MCP when the client
 supports it:
 
 - **MCP** (streamable HTTP): `http://localhost:8000/mcp`, no auth header
-  needed. Six tools: `process_video`, `get_job_status`, `list_clips`,
-  `add_subtitles`, `recut_clip`, `publish_clip`.
+  needed. Seven tools: `process_video`, `create_upload` (hand it a local file
+  instead of a URL), `get_job_status`, `list_clips`, `add_subtitles`,
+  `recut_clip`, `publish_clip`.
 - **REST**: same instance at `http://localhost:8000`. Exact payloads and
   error shapes are in `reference.md`; read it before the first HTTP call.
 

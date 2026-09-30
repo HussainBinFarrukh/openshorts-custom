@@ -99,7 +99,7 @@ export default function McpConnectCard({ cloud = true, compact = false }) {
       </h3>
       <p className="text-muted text-sm mb-4">
         Let Claude, ChatGPT, Cursor or n8n clip and publish for you through the built-in MCP server:
-        8 tools (process a video or upload one, check a job, list clips, add subtitles, recut, publish, quota).
+        7 tools (process a video or upload one, check a job, list clips, add subtitles, recut, publish).
         {cloud
           ? ' claude.ai and ChatGPT connect with one URL and a sign-in; CLI clients use an API key.'
           : ' This install runs without accounts, so no key is needed.'}
