@@ -372,9 +372,9 @@ def _clips_actually_rendered(job_id, output_dir, base_name, clips):
     Trust the disk, not the promise.
     """
     # main.py announces the file it actually finished for each clip
-    # (CLIP_READY, printed after the whole reframe/watermark/hook/caption
-    # chain). Prefer it over rebuilding the name: the marker is what the file
-    # IS, _canonical_clip_file is a guess from the naming convention.
+    # (CLIP_READY, printed after the whole reframe/hook/caption chain).
+    # Prefer it over rebuilding the name: the marker is what the file IS,
+    # _canonical_clip_file is a guess from the naming convention.
     ready_files = (jobs.get(job_id) or {}).get('ready_files') or {}
     kept = []
     for i, clip in enumerate(clips):
@@ -800,7 +800,7 @@ def _install_drain_signal_handler():
         print(f"⚠️ Drain-on-SIGTERM unavailable ({e}); jobs will resume on restart instead.")
 
 
-def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, watermark,
+def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
                            webhook_url=None, webhook_secret=None, base_url=None,
                            partial=None, source_cap_minutes=None):
     try:
@@ -810,7 +810,7 @@ def _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id, water
                 "cmd": cmd, "priority": priority,
                 "user_id": None if user_id is None else str(user_id),
                 "reservation_id": reservation_id,
-                "watermark": bool(watermark), "attempts": 0,
+                "attempts": 0,
                 # The caller's webhook must survive a redeploy: a pipeline that
                 # relies on the callback would otherwise hang forever on a job
                 # that resumed fine. The secret is the caller's own HMAC value,
@@ -898,10 +898,6 @@ def _resume_interrupted_jobs() -> set:
 
         # Rebuild env from scratch — the manifest holds no secrets.
         env = child_env()
-        if m.get("watermark"):
-            env["WATERMARK"] = "1"
-        else:
-            env.pop("WATERMARK", None)
         partial = m.get("partial")
         if partial and partial.get("processed_minutes"):
             env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
@@ -927,7 +923,6 @@ def _resume_interrupted_jobs() -> set:
             'output_dir': job_path,
             'user_id': None if user_id is None else user_id,
             'reservation_id': reservation_id,
-            'watermark': bool(m.get("watermark")),
             'partial': partial or None,
             'webhook_url': m.get("webhook_url"),
             'webhook_secret': m.get("webhook_secret"),
@@ -2391,8 +2386,7 @@ async def process_endpoint(
     env.setdefault("PYTHONIOENCODING", "utf-8")
 
     # Optional layouts are per job. The renderer reads these at import time in
-    # the subprocess, so they must be set before Popen — same path WATERMARK
-    # already takes.
+    # the subprocess, so they must be set before Popen.
     chosen = layout_env(layouts)
     env.update(chosen)
     if chosen:
@@ -2560,10 +2554,6 @@ async def process_endpoint(
         # main.py cuts the source down to this many minutes before anything
         # reads it, so the whole pipeline (and the editor) sees a short video.
         env["MAX_SOURCE_MINUTES"] = str(partial["processed_minutes"])
-    if user_plan == "free":
-        # Free-plan clips carry a burned-in watermark (applied by the main.py
-        # subprocess after each clip renders).
-        env["WATERMARK"] = "1"
 
     # Absolute-URL base for the webhook payload: explicit env wins (the API may
     # sit behind a proxy whose forwarded headers we can't trust), else what the
@@ -2580,7 +2570,6 @@ async def process_endpoint(
         'attestation': attestation,
         'user_id': user_id,
         'reservation_id': reservation_id,
-        'watermark': env.get("WATERMARK") == "1",
         'partial': partial,
         'webhook_url': webhook_url,
         'webhook_secret': webhook_secret,
@@ -2602,7 +2591,6 @@ async def process_endpoint(
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
-                           watermark=jobs[job_id]['watermark'],
                            webhook_url=webhook_url, webhook_secret=webhook_secret,
                            base_url=api_base, partial=partial,
                            source_cap_minutes=source_cap)
@@ -3324,7 +3312,6 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
-            watermark=bool(job.get('watermark')),
             force_strategy=force_strategy,
             captions_transcript=v_transcript)
 
@@ -3678,7 +3665,6 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
-            watermark=bool(job.get('watermark')),
             force_strategy=force_strategy,
             crop_overrides=overrides,
             captions_transcript=v_transcript)

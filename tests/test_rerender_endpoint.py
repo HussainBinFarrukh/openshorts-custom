@@ -245,7 +245,6 @@ class TestRerenderPaths:
         assert call["input_path"].endswith("src.mp4")
         assert call["reframe"] is True
         assert call["output_format"] == "auto"
-        assert call["watermark"] is False
         # Source-absolute times, not rebased.
         assert call["segments"] == [{"start": 45.0, "end": 55.0}]
 

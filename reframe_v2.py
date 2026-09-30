@@ -341,7 +341,7 @@ def _run(cmd):
 
 
 def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
-           force_strategy=None, crop_overrides=None, watermark=False):
+           force_strategy=None, crop_overrides=None):
     """Full v2 reframe of one clip. Raises on failure (caller falls back).
 
     ``content_ranges`` comes from screencast_layout.detect_content_ranges() on
@@ -357,10 +357,6 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     listed keep the automatic camera, so correcting one bad shot never disturbs
     the ones the tracker got right. Applied AFTER force_strategy: a per-scene
     hand position always beats the whole-clip choice for the scenes it names.
-
-    ``watermark`` overlays the free-plan mark (main.watermark_filter) in every
-    segment's own encode, instead of main.apply_watermark re-encoding the
-    finished clip once more.
     """
     import main as m
     content_ranges = content_ranges or []
@@ -525,10 +521,6 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
     ranges = scene_frame_ranges(scene_boundaries, strategies, len(xs))
     if not ranges:
         raise RuntimeError("no usable scene ranges")
-    logo = m.watermark_logo_path() if watermark else None
-    if logo and not os.path.exists(logo):
-        print(f"   ⚠️ Watermark asset missing ({logo}); clip kept unmarked.")
-        logo = None
 
     workdir = tempfile.mkdtemp(prefix="reframe_v2_")
     segments = []
@@ -584,10 +576,6 @@ def render(input_video, final_output_video, aspect_ratio, content_ranges=None,
                 )
 
             inputs, out_label = ["-i", input_video], "[v]"
-            if logo:
-                inputs += ["-i", logo]
-                graph += ";" + m.watermark_filter(out_w, out_h, video="[v]", out="[vw]")
-                out_label = "[vw]"
             _run([
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", f"{ss:.4f}", "-t", f"{dur:.4f}", *inputs,

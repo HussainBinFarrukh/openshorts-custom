@@ -4,8 +4,8 @@ turned into a rendered clip.
 
 The pure helpers here are standard-library only (plus ffmpeg_utils, which is
 also light) so the module imports in the thin CI environment; everything heavy
-(reframing, watermark, auto-captions live in main.py) is imported lazily and
-only on the paths that need it.
+(reframing, auto-captions live in main.py) is imported lazily and only on
+the paths that need it.
 
 Two render paths:
 
@@ -244,8 +244,7 @@ def run_cut_concat(input_path, segments, out_path, workdir, runner=None):
     return out_path
 
 
-# Same ceiling as apply_watermark's: a hung ffmpeg must not pin the executor
-# thread (and the caller's quota reservation) until a server restart.
+# A hung ffmpeg must not pin the executor thread until a server restart.
 FFMPEG_TIMEOUT_SECONDS = 1800
 
 
@@ -263,18 +262,16 @@ def _run_ffmpeg(command):
 
 
 def perform_recut(*, input_path, segments, output_dir, clean_name,
-                  reframe=False, output_format="auto", watermark=False,
+                  reframe=False, output_format="auto",
                   captions_transcript=None, force_strategy=None,
                   crop_overrides=None, runner=None, renderer=None,
-                  watermarker=None, captioner=None):
+                  captioner=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
     - ``input_path``/``segments``: the file to cut from and the times ON THAT
       FILE (the caller rebases for the fast path).
     - ``reframe``: run the reframe engine on the joined cut (source path only —
       the canonical file is already framed).
-    - ``watermark``: re-apply the free-plan watermark (source path only — the
-      canonical file already carries it).
     - ``captions_transcript``: a clip-relative transcript (see
       ``virtual_transcript``); when given and non-empty, captions are burned
       LAST onto a ``subtitled_<ts>_`` derivative, preserving the invariant
@@ -284,9 +281,9 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
       the same reason as ``reframe``: the canonical file is already cropped, so
       its framing can no longer be changed.
 
-    The renderer/watermarker/captioner hooks default to main.py's
-    implementations, imported lazily so this module stays importable without
-    the ML stack; tests inject fakes.
+    The renderer/captioner hooks default to main.py's implementations,
+    imported lazily so this module stays importable without the ML stack;
+    tests inject fakes.
     """
     # The uuid token keeps two same-second saves of one clip from writing (and
     # then serving) the same filename; the timestamp keeps "newest derived
@@ -320,9 +317,6 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
             layout_ranges.write(out_path, [
                 (r["start"], r["end"], r["layout"])
                 for r in layout_ranges.remap(layout_ranges.read(input_path), segments)])
-
-        if watermark:
-            (watermarker or _main_attr("apply_watermark"))(out_path)
 
         served_name = out_name
         if captions_transcript and captions_transcript.get("segments"):

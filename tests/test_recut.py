@@ -266,7 +266,7 @@ class TestPerformRecut:
         assert os.path.exists(tmp_path / clean)
         assert os.path.exists(tmp_path / served)
 
-    def test_source_path_reframes_and_watermarks(self, tmp_path):
+    def test_source_path_reframes(self, tmp_path):
         events = []
 
         def fake_renderer(work, out, output_format):
@@ -278,10 +278,9 @@ class TestPerformRecut:
         served, clean = recut.perform_recut(
             input_path="source.mp4", segments=[_seg(5, 15)],
             output_dir=str(tmp_path), clean_name="t_clip_1.mp4",
-            reframe=True, output_format="vertical", watermark=True,
-            runner=self._touching_runner, renderer=fake_renderer,
-            watermarker=lambda path: events.append(("watermark",)))
-        assert events == [("reframe", "vertical"), ("watermark",)]
+            reframe=True, output_format="vertical",
+            runner=self._touching_runner, renderer=fake_renderer)
+        assert events == [("reframe", "vertical")]
         assert served == clean
 
     def test_renderer_failure_raises_and_cleans_up(self, tmp_path):

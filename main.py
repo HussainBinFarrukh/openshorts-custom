@@ -1327,103 +1327,23 @@ def auto_hook_clip(clip_path, clip, captions=None):
 
 
 def render_clip(input_video, final_output_video, output_format="auto",
-                force_strategy=None, crop_overrides=None, watermark=False):
+                force_strategy=None, crop_overrides=None):
     """Route a cut clip through the right renderer for the chosen output format.
     vertical/auto -> 9:16 reframe, square -> 1:1 reframe, horizontal -> keep.
     ``force_strategy`` (e.g. 'WIDE'/'TRACK') pins every scene's layout — the
     clip editor's whole-clip framing override. ``crop_overrides`` positions
     individual scenes by hand (the per-scene reframing editor) and wins over
-    ``force_strategy`` for the scenes it names.
-    ``watermark`` burns the free-plan mark into the result: inside the reframe
-    encode on the v2 path, as a separate pass (apply_watermark) otherwise."""
+    ``force_strategy`` for the scenes it names."""
     if output_format == "horizontal":
-        ok = finalize_clip_passthrough(input_video, final_output_video)
-        if ok and watermark:
-            apply_watermark(final_output_video)
-        return ok
+        return finalize_clip_passthrough(input_video, final_output_video)
     aspect = 1.0 if output_format == "square" else ASPECT_RATIO
     return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect,
                                      force_strategy=force_strategy,
-                                     crop_overrides=crop_overrides,
-                                     watermark=watermark)
-
-
-# Watermark geometry, as fractions of the clip width/height.
-#
-# Vertical placement is the whole point: the top and bottom strips of a 9:16
-# clip are either black bars or blurred filler (GENERAL layout), so a mark up
-# there is cropped away without touching a single pixel of real footage. At 40%
-# of the height it sits inside the content band — a 16:9 source letterboxed
-# into 9:16 spans roughly 34%-66% — so removing the mark means cutting into the
-# picture. Left-aligned, like OpusClip's.
-WATERMARK_WIDTH_RATIO = 0.30
-WATERMARK_MARGIN_RATIO = 0.05
-WATERMARK_Y_RATIO = 0.40
-WATERMARK_OPACITY = 0.85
-
-
-def watermark_logo_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "assets", "watermark.png")
-
-
-def watermark_filter(vw, vh, video="[0:v]", logo="[1:v]", out=""):
-    """filter_complex chain overlaying the logo input on a vw x vh video."""
-    wm_w = max(80, int(vw * WATERMARK_WIDTH_RATIO))
-    x = int(vw * WATERMARK_MARGIN_RATIO)
-    y = int(vh * WATERMARK_Y_RATIO)
-    return (
-        f"{logo}scale={wm_w}:-1,format=rgba,"
-        f"colorchannelmixer=aa={WATERMARK_OPACITY}[wm];"
-        f"{video}[wm]overlay=x={x}:y={y}{out}"
-    )
-
-
-def apply_watermark(video_path):
-    """Burn the OpenShorts watermark into a finished clip (free plan).
-
-    One re-encode pass on the final file so every output format (TRACK,
-    GENERAL, horizontal passthrough) gets the mark, and later subtitle/hook
-    re-encodes keep it — they re-encode the already-marked pixels.
-    """
-    logo_path = watermark_logo_path()
-    if not os.path.exists(logo_path):
-        print(f"   ⚠️ Watermark asset missing ({logo_path}); clip kept unmarked.")
-        return False
-
-    # Scale the lockup from the clip's real width: overlay can't read the other
-    # input's size, and computing it here avoids the deprecated scale2ref.
-    try:
-        probe = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", video_path],
-            stderr=subprocess.STDOUT, timeout=60,
-        ).decode().strip().split("x")
-        vw, vh = int(probe[0]), int(probe[1])
-    except Exception as e:
-        print(f"   ⚠️ Could not probe clip for watermark ({e}); clip kept unmarked.")
-        return False
-
-    filt = watermark_filter(vw, vh)
-    tmp_path = video_path + ".wm.mp4"
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", logo_path,
-           "-filter_complex", filt,
-           *video_encode_args(QUALITY), "-c:a", "copy", *METADATA_SCRUB,
-           "-movflags", "+faststart", tmp_path]
-    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            timeout=1800)
-    if result.returncode == 0 and os.path.exists(tmp_path):
-        os.replace(tmp_path, video_path)
-        return True
-    err = (result.stderr or b"").decode(errors="ignore")[-300:]
-    print(f"   ⚠️ Watermark pass failed (clip kept unmarked): {err}")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    return False
+                                     crop_overrides=crop_overrides)
 
 
 def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO,
-                              force_strategy=None, crop_overrides=None, watermark=False):
+                              force_strategy=None, crop_overrides=None):
     """
     Core logic to reframe a horizontal video to a target aspect ratio using
     scene detection and Active Speaker Tracking (MediaPipe).
@@ -1440,8 +1360,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
             t0 = time.time()
             result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
                                        force_strategy=force_strategy,
-                                       crop_overrides=crop_overrides,
-                                       watermark=watermark)
+                                       crop_overrides=crop_overrides)
             print(f"   ⏱️ Reframe v2 total: {time.time() - t0:.1f}s")
             return result
         except Exception as e:
@@ -1636,8 +1555,6 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
         if os.path.exists(leftover):
             os.remove(leftover)
 
-    if watermark:
-        apply_watermark(final_output_video)
     return True
 
 # --- Transcript checkpoint (survive a redeploy without paying twice) ---------
@@ -2391,16 +2308,11 @@ if __name__ == '__main__':
                     # ffmpeg cut — re-encoding for precision on strict seconds
                     cut_clip(input_video, clip_temp_path, start, end, i + 1)
 
-                    # Layer order: watermark burns into the canonical (so any
-                    # later hook replacement, which re-derives from it, keeps
-                    # the branding), the hook is a derived hooked_ file, and
-                    # captions go last on top of whichever is current. The
-                    # watermark rides the reframe's own encode instead of a
-                    # pass of its own: one encode less per clip on every
-                    # free-plan job. Each worker writes only its own clip
-                    # dict, so the re-dump after the pool is race-free.
-                    success = render_clip(clip_temp_path, clip_final_path, output_format,
-                                          watermark=os.environ.get("WATERMARK") == "1")
+                    # Layer order: the hook is a derived hooked_ file, and
+                    # captions go last on top of whichever is current. Each
+                    # worker writes only its own clip dict, so the re-dump
+                    # after the pool is race-free.
+                    success = render_clip(clip_temp_path, clip_final_path, output_format)
                     if success:
                         print(f"   🎞️ Clip {i+1} framed")
                     deliver_path = clip_final_path
@@ -2437,8 +2349,8 @@ if __name__ == '__main__':
                         # name, so a job in flight showed every clip stripped of
                         # its hook and captions until the WHOLE job finished and
                         # the result got rebuilt through _canonical_clip_file.
-                        # Printed only after the full chain (reframe, watermark,
-                        # hook, captions) so the file is complete when it is
+                        # Printed only after the full chain (reframe, hook,
+                        # captions) so the file is complete when it is
                         # announced, never one that ffmpeg is still writing.
                         print(f"CLIP_READY {i} "
                               f"{os.path.basename(captioned or deliver_path)}")
