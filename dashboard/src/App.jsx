@@ -5,27 +5,16 @@ import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
-// import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import ClipEditor from './components/ClipEditor';
 import ReframeEditor from './components/ReframeEditor';
-import UsageMeter from './components/UsageMeter';
-import TopUpModal from './components/TopUpModal';
 import StarBanner from './components/StarBanner';
-import PlanChoiceModal from './components/PlanChoiceModal';
 import ClipTutorial from './components/ClipTutorial';
-import OnboardingSurvey from './components/OnboardingSurvey';
-import TrialUpgradeModal from './components/TrialUpgradeModal';
-import LoginModal from './components/LoginModal';
-import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
-import HistoryTab from './components/HistoryTab';
-import AutopilotTab from './components/AutopilotTab';
 import PipelineTab from './components/PipelineTab';
-import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
@@ -33,7 +22,7 @@ import { track } from './lib/analytics';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
-const SECRET_KEY = import.meta.env.VITE_ENCRYPTION_KEY || "OpenShorts-Static-Salt-Change-Me";
+const SECRET_KEY = import.meta.env.VITE_ENCRYPTION_KEY || "ClipLinQ-Static-Salt-Change-Me";
 const ENCRYPTION_PREFIX = "ENC:";
 
 const encrypt = (text) => {
@@ -96,16 +85,6 @@ const isAutoProfileId = (username) => /^os_[0-9a-f]/i.test(username || "");
 const PENDING_JOB_KEY = 'os_pending_job';
 const PENDING_JOB_TTL_MS = 60 * 60 * 1000;
 let pendingJobInMemory = null;
-
-function stashPendingJob(data) {
-  const stamp = Date.now();
-  const entry = { stamp, data: { ...data, payload: typeof data?.payload === 'string' ? data.payload : null } };
-  pendingJobInMemory = { stamp, data };
-  try {
-    localStorage.setItem(PENDING_JOB_KEY, JSON.stringify(entry));
-  } catch (_) { /* private mode: the in-memory copy still covers same-document flows */ }
-  return stamp;
-}
 
 function peekPendingJob() {
   try {
@@ -266,20 +245,14 @@ const pollJob = async (jobId) => {
   return res.json();
 };
 
+// No cloud/billing mode: self-host has no user model, no plans, no quota.
+const billingEnabled = false;
+const isManaged = false;
+const refreshMe = () => {};
+
 function App() {
-  // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe, jobRetentionSeconds, localLlm } = useAuth();
-  const [showLogin, setShowLogin] = useState(false);
-  const [showTopUp, setShowTopUp] = useState(false);
-  const [showPlanChoice, setShowPlanChoice] = useState(false);
+  const { jobRetentionSeconds, localLlm } = useAuth();
   const [tutorialPhase, setTutorialPhase] = useState(null); // null | intro | coach | celebrate
-  const [showTrialUpgrade, setShowTrialUpgrade] = useState(false);
-  const [topUpInfo, setTopUpInfo] = useState({});
-  // {processed_minutes, total_minutes} when the running/finished job clips
-  // only the first part of the source (the quota wall's free offer).
-  const [partialJob, setPartialJob] = useState(null);
-  // The free plan's first video, clipped whole past the 20-minute balance.
-  const [firstVideoJob, setFirstVideoJob] = useState(false);
   // {position, ahead, eta_seconds} while the job waits in line, else null.
   const [queueInfo, setQueueInfo] = useState(null);
   // Why the last job could not start or failed, in plain words (or '').
@@ -505,23 +478,6 @@ function App() {
     handleClipStateChange(index, { activeLayers: null, serverVideoFile: newFile });
   };
 
-  // Reopen an archived project from the History tab: the backend re-downloads
-  // its files from R2 into the server's working dir and returns the full state.
-  const restoreProject = async (projectJobId) => {
-    const data = await apiJson(`/api/projects/${projectJobId}/restore`, { method: 'POST' });
-    flushClipState();
-    setProjectState(data.project_state || null);
-    setNoSource(true);
-    setJobId(data.job_id);
-    setResults(data.result || null);
-    setLogs(['♻️ Project restored from your library.']);
-    setLogTimes([Date.now() / 1000]);
-    setProcessingMedia(null);
-    setQualityGate(null);
-    setStatus('complete');
-    setActiveTab('dashboard');
-  };
-
   // Apply one subtitle style to every clip of the job, sequentially.
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
@@ -741,7 +697,6 @@ function App() {
             setResults(data.result);
           }
 
-          if (data.partial) setPartialJob(data.partial);
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
 
           if (data.status === 'completed') {
@@ -769,7 +724,7 @@ function App() {
       }, 2000);
     }
     return () => clearInterval(interval);
-  }, [status, jobId, refreshMe]);
+  }, [status, jobId]);
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -836,38 +791,16 @@ function App() {
     }
   }, []);
 
-  // Legacy: an older build may still have set os_show_plan_choice. Don't open it
-  // on top of the tutorial.
-  useEffect(() => {
-    if (tutorialPhase) return;
-    if (!(billingEnabled && isSignedIn)) return;
-    let showPlans = false;
-    try { showPlans = localStorage.getItem('os_show_plan_choice') === '1'; } catch (_) { /* ignore */ }
-    if (showPlans) {
-      setShowPlanChoice(true);
-      try { localStorage.removeItem('os_show_plan_choice'); } catch (_) { /* ignore */ }
-    }
-  }, [billingEnabled, isSignedIn, tutorialPhase]);
-
   const tutorialLock = tutorialPhase === 'intro' || tutorialPhase === 'coach' || tutorialPhase === 'celebrate';
-
-  // Sign-up survey (cloud/onboarding.py): before the tutorial intro, never on
-  // top of a job that is already running (a parked request resuming, or the
-  // coach phase) or of the celebration.
-  const [surveyDone, setSurveyDone] = useState(false);
-  const showSurvey = billingEnabled && !!me?.onboarding_survey_pending && !surveyDone
-    && (tutorialPhase === null || tutorialPhase === 'intro') && status === 'idle';
 
   useEffect(() => {
     if (tutorialLock && activeTab !== 'dashboard') setActiveTab('dashboard');
   }, [tutorialLock, activeTab]);
 
-  // Deep links into a tab: #app?tab=autopilot (Autopilot emails, the social
-  // connect page's return URL). Read once per hash change, then the query is
-  // dropped so a reload does not keep forcing the tab.
-  const [autopilotConnected, setAutopilotConnected] = useState(false);
+  // Deep links into a tab: #app?tab=pipeline etc. Read once per hash change,
+  // then the query is dropped so a reload does not keep forcing the tab.
   useEffect(() => {
-    const DEEP_LINK_TABS = ['autopilot', 'pipeline', 'history', 'settings', 'thumbnails', 'dashboard'];
+    const DEEP_LINK_TABS = ['pipeline', 'settings', 'thumbnails', 'dashboard'];
     const apply = () => {
       const hash = window.location.hash || '';
       if (!hash.startsWith('#app?')) return;
@@ -875,7 +808,6 @@ function App() {
       const tab = params.get('tab');
       if (!tab || !DEEP_LINK_TABS.includes(tab)) return;  // e.g. #app?tutorial=1
       setActiveTab(tab);
-      if (tab === 'autopilot' && params.get('connected') === '1') setAutopilotConnected(true);
       try { window.history.replaceState(null, '', '#app'); } catch (_) { /* ignore */ }
     };
     apply();
@@ -940,28 +872,8 @@ function App() {
     }
   };
 
-  // Open the Upload-Post white-label page (which includes the scheduling calendar)
-  // in a new tab, for consulting/managing scheduled posts from the dashboard.
-  const handleOpenCalendar = async () => {
-    try {
-      const { access_url } = await apiJson('/api/social/connect', { method: 'POST' });
-      if (access_url) window.open(access_url, '_blank', 'noopener');
-    } catch (e) {
-      alert('Could not open the calendar. Please try again.');
-    }
-  };
-
   const handleProcess = async (data, forceLowQuality = false) => {
-    // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
-    if (billingEnabled) {
-      // The billing gate below is unchanged: signed in, then entitled, then the
-      // processing path. The only new thing is the first branch remembering what
-      // the visitor asked for before sending them to sign in, so the resume
-      // effect can hand the exact same request back to this function and let it
-      // fall through the same gates.
-      if (!isSignedIn) { stashPendingJob(data); setShowLogin(true); return; }
-      if (!isManaged) { window.location.hash = '#/pricing'; return; }
-    } else if (keysMissing) {
+    if (keysMissing) {
       setShowKeyModal(true);
       return;
     }
@@ -978,8 +890,6 @@ function App() {
     setQualityGate(null);
     setProjectState(null);
     setNoSource(false);
-    setPartialJob(null);
-    setFirstVideoJob(false);
 
     try {
       let body;
@@ -1048,14 +958,6 @@ function App() {
       }
 
       setJobId(resData.job_id);
-      setPartialJob(resData.partial || null);
-      setFirstVideoJob(!!resData.first_video);
-      // The server clipped past the balance on its own (no wall): the first
-      // video whole, or the first N minutes of a later one.
-      if (resData.first_video) track('FirstVideoGrant');
-      else if (resData.partial && data.maxMinutes == null) {
-        track('AutoPartial', { props: { processed: resData.partial.processed_minutes, total: resData.partial.total_minutes } });
-      }
       if (data.type === 'thumbnail_session') {
         setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
       }
@@ -1063,60 +965,12 @@ function App() {
       refreshMe();
 
     } catch (e) {
-      if (e instanceof QuotaError) {
-        setStatus('idle');
-        refreshMe();
-        // Trial users hit the trial minute cap → prompt them to activate the plan
-        // now (unlocks full minutes). Active users → offer a top-up.
-        if (me?.status === 'trialing') {
-          setShowTrialUpgrade(true);
-        } else {
-          // The wall can offer the first N minutes of this same submission on
-          // the minutes they have: same data, plus max_minutes.
-          const partial = e.partialMinutes || 0;
-          setTopUpInfo({
-            required: e.minutesRequired,
-            remaining: e.minutesRemaining,
-            partialMinutes: partial,
-            onPartial: partial
-              ? () => {
-                  track('PartialClipChosen', { props: { required: e.minutesRequired, partial } });
-                  setShowTopUp(false);
-                  handleProcess({ ...data, maxMinutes: partial }, forceLowQuality);
-                }
-              : null,
-          });
-          setShowTopUp(true);
-        }
-        return;
-      }
       const reason = readableError(e.message);
       setJobError(reason);
       setStatus('error');
       setLogs(l => [...l, `Error starting job: ${reason}`]);
     }
   };
-
-  // Resume the job the visitor started before signing in. Runs on the render
-  // that first sees isSignedIn true — after a magic link or a Google round trip,
-  // i.e. a fresh document — and replays the request through handleProcess, so
-  // the entitlement gate still decides whether it actually runs: an unentitled
-  // account lands on #/pricing with the request still parked, and pays for it
-  // later. `resumedStamp` keeps one parked request from being replayed twice in
-  // the same document (the pricing redirect would otherwise loop on it).
-  const handleProcessRef = useRef(null);
-  const resumedStampRef = useRef(0);
-  useEffect(() => {
-    handleProcessRef.current = handleProcess;
-  });
-  useEffect(() => {
-    if (!billingEnabled || !isSignedIn) return;
-    const pending = peekPendingJob();
-    if (!pending || pending.stamp === resumedStampRef.current) return;
-    resumedStampRef.current = pending.stamp;
-    track('JobResumedAfterSignin', { props: { type: pending.data?.type || 'unknown' } });
-    handleProcessRef.current(pending.data);
-  }, [billingEnabled, isSignedIn]);
 
   const handleReset = () => {
     // Flush any pending edit-state sync before dropping the project: the clips
@@ -1130,8 +984,6 @@ function App() {
     setProcessingMedia(null);
     setProjectState(null);
     setNoSource(false);
-    setPartialJob(null);
-    setFirstVideoJob(false);
     setQueueInfo(null);
     setJobError('');
     localStorage.removeItem(SESSION_KEY);
@@ -1144,15 +996,12 @@ function App() {
   // wraps to two lines in a 5-up bar on a 360px phone.
   const navItems = [
     { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator', short: 'clips', primary: true },
-    // Cloud only: it runs on the managed pipeline and the Upload-Post connection.
-    ...(billingEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot', short: 'autopilot', isNew: true }] : []),
-    // Self-host only: the automation pipeline in pipeline/ (docs/PIPELINE.md).
-    ...(!billingEnabled ? [{ id: 'pipeline', ord: '02', icon: Workflow, label: 'Pipeline', short: 'pipeline', primary: true }] : []),
+    // The self-host automation pipeline (pipeline/, docs/PIPELINE.md).
+    { id: 'pipeline', ord: '02', icon: Workflow, label: 'Pipeline', short: 'pipeline', primary: true },
     { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', short: 'ai shorts', byok: true, primary: true },
     { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -1408,34 +1257,11 @@ function App() {
               />
             )}
 
-            {/* Cloud: minutes meter + account/sign-in. For free users the meter
-                opens the upgrade modal — otherwise the only path to a plan is
-                failing against the quota wall. */}
-            {billingEnabled && isManaged && (
-              <UsageMeter onClick={() => {
-                if (plan === 'free') { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }
-                else { window.location.hash = '#/account'; }
-              }} />
-            )}
-            {billingEnabled && isSignedIn && !isManaged && (
-              <button onClick={() => setShowPlanChoice(true)}
-                className="btn-primary px-4 py-2 text-xs">
-                Choose a plan
-              </button>
-            )}
-            {billingEnabled && !isSignedIn && (
-              <button onClick={() => setShowLogin(true)}
-                className="btn-ghost px-4 py-2 text-xs">
-                Sign in
-              </button>
-            )}
-            {billingEnabled && isSignedIn && <ProfileMenu />}
-
             {/* Hidden below sm: the standing banner underneath already says the
                 same thing, and two warnings in a 360px header is just noise. */}
             {keysMissing && (
               <button
-                onClick={() => (billingEnabled && !isSignedIn ? setShowLogin(true) : goToTab('settings'))}
+                onClick={() => goToTab('settings')}
                 className="badge-warn hover:brightness-125 transition-all hidden sm:inline-flex"
                 title="Configure API keys or choose a plan"
               >
@@ -1517,54 +1343,8 @@ function App() {
                   <Shield size={12} className="text-ok shrink-0" /> Privacy: keys only live in your browser (sent to backend just to process)
                 </div>
               </div>
-              {/* Self-hosted installs have no account page, so the agent
-                  how-to lives here; cloud users get it (with OAuth) in Account. */}
-              {!billingEnabled && <div className="mb-6"><McpConnectCard cloud={false} /></div>}
-              {isManaged ? (
-                <div className="card p-6 mb-2">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-input bg-paper3 flex items-center justify-center shrink-0">
-                        <Shield size={16} className="text-brass" />
-                      </div>
-                      <h2 className="text-base font-medium text-ink lowercase">Included in your plan</h2>
-                    </div>
-                    <span className="badge-ok">Managed</span>
-                  </div>
-                  <p className="text-xs text-muted mb-5 leading-relaxed">
-                    Your plan includes the <strong>Clip Generator</strong> and <strong>YouTube Studio</strong>,
-                    fully managed — no API keys required. AI Shorts &amp; dubbing use your own fal.ai / ElevenLabs
-                    keys (below). Connect your social accounts to publish directly.
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button onClick={handleConnectSocials} className="btn-primary py-2 px-4 text-sm">
-                      <Share2 size={16} /> Connect social accounts
-                    </button>
-                    <button onClick={handleOpenCalendar} className="btn-quiet py-2 px-4 text-sm">
-                      <Calendar size={16} /> Content calendar
-                    </button>
-                  </div>
-                </div>
-              ) : billingEnabled ? (
-                <div className="card p-6 mb-2">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-input bg-paper3 flex items-center justify-center shrink-0">
-                        <Sparkles size={16} className="text-brass" />
-                      </div>
-                      <h2 className="text-base font-medium text-ink lowercase">Choose your plan</h2>
-                    </div>
-                    <span className="badge-ok">Free plan available</span>
-                  </div>
-                  <p className="text-xs text-muted mb-5 leading-relaxed">
-                    Generate shorts with zero setup — no API keys needed. Start free with 20 min/month, or go paid from $12/mo. Cancel anytime.
-                  </p>
-                  <button onClick={() => setShowPlanChoice(true)} className="btn-primary py-2 px-4 text-sm">
-                    <Sparkles size={16} /> Choose a plan
-                  </button>
-                </div>
-              ) : (
-                <>
+              {/* Self-hosted: the agent how-to (no OAuth, plain BYOK). */}
+              <div className="mb-6"><McpConnectCard cloud={false} /></div>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
 
               <div className="card p-4 sm:p-6 mt-8">
@@ -1618,9 +1398,6 @@ function App() {
                   </div>
                 </div>
               </div>
-
-                </>
-              )}
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -1869,45 +1646,11 @@ function App() {
             </div>
           )}
 
-          {/* View: Autopilot */}
-          {activeTab === 'autopilot' && (
-            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
-              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                {isSignedIn ? (
-                  <AutopilotTab
-                    onOpenProject={restoreProject}
-                    onUpgrade={() => setShowPlanChoice(true)}
-                    justConnected={autopilotConnected}
-                  />
-                ) : (
-                  <div className="max-w-2xl mx-auto card p-8 text-center">
-                    <Rocket size={28} className="mx-auto mb-4 text-brass" />
-                    <h1 className="font-display lowercase text-2xl text-ink mb-2">your channel, clipped on its own</h1>
-                    <p className="text-muted text-sm mb-6">
-                      Connect your YouTube channel and every new video turns into shorts automatically.
-                      Sign in to set it up.
-                    </p>
-                    <button onClick={() => setShowLogin(true)} className="btn-primary">sign in</button>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* View: Pipeline (self-host) */}
-          {activeTab === 'pipeline' && !billingEnabled && (
+          {/* View: Pipeline (self-host automation) */}
+          {activeTab === 'pipeline' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
                 <PipelineTab />
-              </div>
-            </div>
-          )}
-
-          {/* View: History */}
-          {activeTab === 'history' && (
-            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
-              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
-                <HistoryTab onReopenProject={restoreProject} />
               </div>
             </div>
           )}
@@ -1926,11 +1669,6 @@ function App() {
               }}
             />
           )}
-
-          {/* View: Gallery */}
-          {/* {activeTab === 'gallery' && (
-            <Gallery />
-          )} */}
 
           {/* View: Dashboard (Idle) */}
           {activeTab === 'dashboard' && status === 'idle' && (
@@ -2004,14 +1742,6 @@ function App() {
                         ? 'You are next in line. Starting in a moment…'
                         : <>You are <b>#{queueInfo.position}</b> in line · about <b>{Math.max(1, Math.round(queueInfo.eta_seconds / 60))} min</b></>}
                     </p>
-                    {billingEnabled && !['starter', 'creator', 'pro'].includes(plan) && queueInfo.ahead > 0 && (
-                      <button
-                        onClick={() => { track('QueueUpsellClick', { props: { position: String(queueInfo.position) } }); setShowPlanChoice(true); }}
-                        className="mt-2 text-xs lowercase text-brass hover:underline"
-                      >
-                        paid plans skip the line →
-                      </button>
-                    )}
                   </div>
                 )}
 
@@ -2129,39 +1859,6 @@ function App() {
 
                 {status === 'complete' && results?.clips?.length > 0 && (
                   <div className="mb-2 space-y-2">
-                    {/* Partial job: the clips on screen come from the first N
-                        minutes only. Say so, and sell the rest of the video. */}
-                    {partialJob && (
-                      <button
-                        onClick={() => { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }}
-                        className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
-                      >
-                        <span className="text-ink">These clips come from the first {partialJob.processed_minutes} of {partialJob.total_minutes} minutes.</span>{' '}
-                        <span className="text-brass font-medium">Clip the whole video →</span>
-                      </button>
-                    )}
-                    {/* Peak-moment upsell: they just SAW their clips — sell while
-                        they're proud of the result, before asking for stars. */}
-                    {firstVideoJob && !partialJob && (
-                      <button
-                        onClick={() => { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }}
-                        className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
-                      >
-                        <span className="text-ink">Your first video is on us: we clipped all of it.</span>{' '}
-                        <span className="text-muted">That used this month's free minutes.</span>{' '}
-                        <span className="text-brass font-medium">Keep clipping →</span>
-                      </button>
-                    )}
-                    {plan === 'free' && !partialJob && !firstVideoJob && (
-                      <button
-                        onClick={() => { setTopUpInfo({ context: 'upsell' }); setShowTopUp(true); }}
-                        className="w-full text-left px-3 py-2.5 rounded-input bg-paper3 border border-brass/40 hover:border-brass text-sm transition-colors"
-                      >
-                        <span className="text-ink">Like these clips?</span>{' '}
-                        <span className="text-muted">They carry a watermark and delete in 7 days.</span>{' '}
-                        <span className="text-brass font-medium">Keep them forever →</span>
-                      </button>
-                    )}
                     {/* Distribution nudge at the same peak: clips on screen,
                         publishing them is one connect away. Hidden once any
                         network is linked or the user dismisses it. */}
@@ -2422,9 +2119,7 @@ function App() {
           onReframed={handleClipRerendered}
         />
       )}
-      {showLogin && <LoginModal onClose={() => setShowLogin(false)} queued={typeof peekPendingJob()?.data?.payload === 'string'} />}
-      {showSurvey && <OnboardingSurvey onDone={() => setSurveyDone(true)} />}
-      {tutorialPhase && !showSurvey && (
+      {tutorialPhase && (
         <ClipTutorial
           phase={tutorialPhase}
           jobStatus={status}
@@ -2432,24 +2127,6 @@ function App() {
           onStart={startTutorial}
           onSkip={skipTutorial}
           onDismissCelebrate={finishTutorial}
-        />
-      )}
-      {showPlanChoice && <PlanChoiceModal onClose={() => setShowPlanChoice(false)} />}
-      {showTopUp && (
-        <TopUpModal
-          onClose={() => setShowTopUp(false)}
-          required={topUpInfo.required}
-          remaining={topUpInfo.remaining}
-          partialMinutes={topUpInfo.partialMinutes}
-          onPartial={topUpInfo.onPartial}
-          context={topUpInfo.context || 'wall'}
-        />
-      )}
-      {showTrialUpgrade && (
-        <TrialUpgradeModal
-          plan={plan}
-          onActivated={refreshMe}
-          onClose={() => setShowTrialUpgrade(false)}
         />
       )}
     </div>
